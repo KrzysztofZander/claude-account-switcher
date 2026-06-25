@@ -1,0 +1,160 @@
+:root {
+  color-scheme: light dark;
+}
+
+body {
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size);
+  color: var(--vscode-foreground);
+  padding: 8px;
+  margin: 0;
+}
+
+.hidden {
+  display: none !important;
+}
+
+#toolbar {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+button {
+  font-family: inherit;
+  font-size: 12px;
+  border: 1px solid var(--vscode-button-border, transparent);
+  border-radius: 4px;
+  padding: 4px 8px;
+  cursor: pointer;
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
+}
+
+button:hover {
+  background: var(--vscode-button-secondaryHoverBackground);
+}
+
+button.primary {
+  flex: 1;
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+}
+
+button.primary:hover {
+  background: var(--vscode-button-hoverBackground);
+}
+
+.card {
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.3));
+  border-radius: 6px;
+  padding: 10px;
+  margin-bottom: 8px;
+  background: var(--vscode-editorWidget-background, transparent);
+}
+
+.card.active {
+  border-color: var(--vscode-focusBorder);
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.title {
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.badge {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 10px;
+  background: var(--vscode-badge-background);
+  color: var(--vscode-badge-foreground);
+}
+
+.badge.active {
+  background: var(--vscode-testing-iconPassed, #2ea043);
+  color: #fff;
+}
+
+.sub {
+  font-size: 11px;
+  opacity: 0.7;
+}
+
+.meter {
+  margin-top: 8px;
+}
+
+.meter-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  margin-bottom: 2px;
+}
+
+.bar {
+  height: 6px;
+  border-radius: 4px;
+  background: var(--vscode-progressBar-background, rgba(128, 128, 128, 0.25));
+  overflow: hidden;
+}
+
+.bar > .fill {
+  height: 100%;
+  border-radius: 4px;
+  background: var(--vscode-charts-green, #2ea043);
+  transition: width 0.3s ease;
+}
+
+.fill.warn {
+  background: var(--vscode-charts-yellow, #d7a824);
+}
+
+.fill.danger {
+  background: var(--vscode-charts-red, #e5534b);
+}
+
+.reset {
+  font-size: 10px;
+  opacity: 0.6;
+}
+
+.error {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--vscode-errorForeground);
+}
+
+.actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.actions button {
+  flex: 1;
+}
+
+.icon-btn {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+}
+
+#empty {
+  opacity: 0.75;
+  font-size: 12px;
+  line-height: 1.5;
+}
