@@ -3,6 +3,8 @@ import * as os from "os";
 import * as path from "path";
 import { parseUsage } from "../src/usage";
 import { CredentialsManager } from "../src/credentials";
+import { fmtResetCompact, buildAccountItems } from "../src/extension";
+import { StatusBarController } from "../src/ui/statusBar";
 
 let failures = 0;
 function check(name: string, cond: boolean): void {
@@ -61,6 +63,49 @@ const rawAfter = JSON.parse(fs.readFileSync(credPath, "utf8"));
 check("preserves extra fields on write", rawAfter.otherField === 123 && rawAfter.claudeAiOauth.accessToken === "BBB");
 
 fs.rmSync(tmpDir, { recursive: true, force: true });
+
+console.log("fmtResetCompact:");
+const now = Date.now();
+check("< 1h -> minutes", fmtResetCompact(new Date(now + 45 * 60000).toISOString()) === "45m");
+check("hours+minutes", fmtResetCompact(new Date(now + (2 * 60 + 15) * 60000).toISOString()) === "2h15m");
+check("days+hours", fmtResetCompact(new Date(now + (3 * 24 + 4) * 3600000).toISOString()) === "3d4h");
+check("past/zero -> now", fmtResetCompact(new Date(now - 1000).toISOString()) === "now");
+check("null -> undefined", fmtResetCompact(null) === undefined);
+
+console.log("buildAccountItems:");
+const acct = {
+  id: "a1",
+  label: "Backup",
+  subscriptionType: "pro",
+  addedAt: 0,
+  order: 0,
+  lastUsage: {
+    fetchedAt: now,
+    sessionPercent: 1,
+    weeklyPercent: 15,
+    windows: [
+      { kind: "session", label: "Session (5h)", percent: 1, severity: "normal", resetsAt: new Date(now + 135 * 60000).toISOString() },
+      { kind: "weekly_all", label: "Weekly (all)", percent: 15, severity: "normal", resetsAt: new Date(now + (3 * 24 + 4) * 3600000).toISOString() },
+    ],
+  },
+};
+const itemsOut = buildAccountItems([acct as never], undefined);
+check(
+  "description has '5h: 1% - 2h15m | weekly: 15% - 3d4h'",
+  itemsOut[0].description === "pro  ·  5h: 1% - 2h15m | weekly: 15% - 3d4h"
+);
+
+console.log("StatusBarController:");
+const fakeStore = {
+  getActiveId: () => "a1",
+  get: (id: string) => (id === "a1" ? acct : undefined),
+} as never;
+const sb = new StatusBarController(fakeStore);
+sb.refresh();
+check(
+  "status bar text shows '1%-15%'",
+  (sb as never as { item: { text: string } }).item.text === "$(account) Backup · 1%-15%"
+);
 
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);

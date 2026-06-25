@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { AccountStore } from "../accountStore";
 
 /**
- * Status bar item: the active account + the 5h window usage %.
+ * Status bar item: the active account + 5h/7-day usage as "5h%-7d%".
  * Clicking opens the quick account switcher.
  */
 export class StatusBarController {
@@ -27,7 +27,13 @@ export class StatusBarController {
 
     const usage = active.lastUsage;
     const session = usage?.sessionPercent;
-    const pctText = typeof session === "number" ? ` · ${session}%` : "";
+    const weekly = usage?.weeklyPercent;
+    let pctText = "";
+    if (typeof session === "number" && typeof weekly === "number") {
+      pctText = ` · ${session}%-${weekly}%`;
+    } else if (typeof session === "number") {
+      pctText = ` · ${session}%`;
+    }
     this.item.text = `$(account) ${active.label}${pctText}`;
 
     const lines = [`Active Claude account: ${active.label}`];

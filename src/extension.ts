@@ -147,6 +147,49 @@ export function deactivate(): void {
   /* resources are released via context.subscriptions */
 }
 
+/** Compact countdown string ("2h15m", "45m", "3d4h") for a resets_at ISO timestamp. */
+export function fmtResetCompact(iso: string | null | undefined): string | undefined {
+  if (!iso) return undefined;
+  const t = new Date(iso).getTime();
+  if (isNaN(t)) return undefined;
+  const diff = t - Date.now();
+  if (diff <= 0) return "now";
+  const mins = Math.round(diff / 60000);
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  const rem = mins % 60;
+  if (hours < 24) return `${hours}h${rem}m`;
+  const days = Math.floor(hours / 24);
+  return `${days}d${hours % 24}h`;
+}
+
+/** Builds the QuickPick items (label/description) for the account list — pure, for testability. */
+export function buildAccountItems(
+  accounts: AccountProfile[],
+  activeId: string | undefined
+): { label: string; description: string; id: string }[] {
+  return accounts.map((p: AccountProfile) => {
+    const u = p.lastUsage;
+    const session = u?.windows.find((w) => w.kind === "session");
+    const weekly = u?.windows.find((w) => w.kind === "weekly_all" || w.kind.startsWith("weekly"));
+    const parts: string[] = [];
+    if (typeof u?.sessionPercent === "number") {
+      const reset = fmtResetCompact(session?.resetsAt);
+      parts.push(`5h: ${u.sessionPercent}%` + (reset ? ` - ${reset}` : ""));
+    }
+    if (typeof u?.weeklyPercent === "number") {
+      const reset = fmtResetCompact(weekly?.resetsAt);
+      parts.push(`weekly: ${u.weeklyPercent}%` + (reset ? ` - ${reset}` : ""));
+    }
+    if (u?.error) parts.push("⚠ usage error");
+    return {
+      label: (p.id === activeId ? "$(check) " : "$(account) ") + p.label,
+      description: [p.subscriptionType, parts.join(" | ")].filter(Boolean).join("  ·  "),
+      id: p.id,
+    };
+  });
+}
+
 /** Shared account-picker QuickPick with a usage preview. */
 async function pickAccount(store: AccountStore, title: string): Promise<string | undefined> {
   const activeId = store.getActiveId();
@@ -158,18 +201,7 @@ async function pickAccount(store: AccountStore, title: string): Promise<string |
     return undefined;
   }
 
-  const items = accounts.map((p: AccountProfile) => {
-    const u = p.lastUsage;
-    const parts: string[] = [];
-    if (typeof u?.sessionPercent === "number") parts.push(`5h: ${u.sessionPercent}%`);
-    if (typeof u?.weeklyPercent === "number") parts.push(`weekly: ${u.weeklyPercent}%`);
-    if (u?.error) parts.push("⚠ usage error");
-    return {
-      label: (p.id === activeId ? "$(check) " : "$(account) ") + p.label,
-      description: [p.subscriptionType, parts.join("  ")].filter(Boolean).join("  ·  "),
-      id: p.id,
-    };
-  });
+  const items = buildAccountItems(accounts, activeId);
 
   const picked = await vscode.window.showQuickPick(items, {
     title,
