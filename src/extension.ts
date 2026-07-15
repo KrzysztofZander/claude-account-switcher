@@ -1,5 +1,12 @@
 import * as vscode from "vscode";
 import { AccountStore } from "./accountStore";
+import { AccountWindowService } from "./accountWindow";
+import {
+  getConfiguredClaudeCommand,
+  missingClaudeCliMessage,
+  quoteForTerminal,
+  resolveClaudeCommand,
+} from "./cli";
 import { CredentialsManager } from "./credentials";
 import { TokenRefresher } from "./oauth";
 import { SwitchService } from "./switchService";
@@ -7,12 +14,15 @@ import { AccountsViewProvider } from "./ui/accountsView";
 import { StatusBarController } from "./ui/statusBar";
 import { UsagePoller } from "./usage";
 import { AccountProfile } from "./types";
+import { WarmupService } from "./warmup";
 
 export function activate(context: vscode.ExtensionContext): void {
   const store = new AccountStore(context);
   const credentials = new CredentialsManager();
   const refresher = new TokenRefresher();
   const switchService = new SwitchService(store, credentials);
+  const warmupService = new WarmupService(context, store, credentials);
+  const accountWindowService = new AccountWindowService(context, store, credentials);
   const statusBar = new StatusBarController(store);
   const viewProvider = new AccountsViewProvider(context.extensionUri, store);
 
@@ -73,6 +83,53 @@ export function activate(context: vscode.ExtensionContext): void {
       } else {
         await poller.pollAll(true);
       }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("claudeSwitcher.sayHi", async (id?: string) => {
+      const targetIds = id ? [id] : await pickWarmupTargets(store);
+      if (!targetIds || targetIds.length === 0) {
+        return;
+      }
+
+      for (const targetId of targetIds) {
+        const res = await warmupService.sayHi(targetId);
+        vscode.window[res.ok ? "showInformationMessage" : "showWarningMessage"](res.message);
+        if (res.ok) {
+          await poller.pollOne(targetId, true);
+        }
+      }
+      refreshUI();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("claudeSwitcher.openIndependentWindow", async (id?: string) => {
+      const targetIds = id ? [id] : await pickWindowTargets(store);
+      if (!targetIds || targetIds.length === 0) {
+        return;
+      }
+
+      for (const targetId of targetIds) {
+        const res = await accountWindowService.open(targetId);
+        vscode.window[res.ok ? "showInformationMessage" : "showWarningMessage"](res.message);
+      }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("claudeSwitcher.login", () => {
+      const configuredCommand = getConfiguredClaudeCommand();
+      const resolvedCommand = resolveClaudeCommand(configuredCommand);
+      if (!resolvedCommand) {
+        vscode.window.showWarningMessage(missingClaudeCliMessage());
+      }
+
+      const command = resolvedCommand ?? configuredCommand;
+      const terminal = vscode.window.createTerminal({ name: "Claude Login" });
+      terminal.show();
+      terminal.sendText(`${quoteForTerminal(command)} auth login`);
     })
   );
 
@@ -209,4 +266,76 @@ async function pickAccount(store: AccountStore, title: string): Promise<string |
     matchOnDescription: true,
   });
   return picked?.id;
+}
+
+async function pickWarmupTargets(store: AccountStore): Promise<string[] | undefined> {
+  const accounts = store.list();
+  const activeId = store.getActiveId();
+  if (accounts.length === 0) {
+    vscode.window.showInformationMessage(
+      "No saved accounts. Use \"Save current account as profile\" first."
+    );
+    return undefined;
+  }
+
+  const inactive = accounts.filter((p) => p.id !== activeId);
+  const items: Array<{ label: string; description?: string; ids: string[] }> = [];
+  if (inactive.length > 1) {
+    items.push({
+      label: "$(run-all) Say Hi on all inactive accounts",
+      description: `${inactive.length} accounts`,
+      ids: inactive.map((p) => p.id),
+    });
+  }
+  for (const p of accounts) {
+    items.push({
+      label: (p.id === activeId ? "$(circle-slash) " : "$(comment) ") + p.label,
+      description:
+        p.id === activeId
+          ? "active account is skipped to avoid token races"
+          : p.subscriptionType,
+      ids: p.id === activeId ? [] : [p.id],
+    });
+  }
+
+  const picked = await vscode.window.showQuickPick(items, {
+    title: "Say Hi",
+    placeHolder: "Select account to warm up",
+    matchOnDescription: true,
+  });
+  return picked?.ids;
+}
+
+async function pickWindowTargets(store: AccountStore): Promise<string[] | undefined> {
+  const accounts = store.list();
+  if (accounts.length === 0) {
+    vscode.window.showInformationMessage(
+      "No saved accounts. Use \"Save current account as profile\" first."
+    );
+    return undefined;
+  }
+
+  const activeId = store.getActiveId();
+  const items: Array<{ label: string; description?: string; ids: string[] }> = [];
+  if (accounts.length > 1) {
+    items.push({
+      label: "$(run-all) Open all accounts in independent windows",
+      description: `${accounts.length} windows`,
+      ids: accounts.map((p) => p.id),
+    });
+  }
+  for (const p of accounts) {
+    items.push({
+      label: (p.id === activeId ? "$(check) " : "$(window) ") + p.label,
+      description: p.id === activeId ? "current account" : p.subscriptionType,
+      ids: [p.id],
+    });
+  }
+
+  const picked = await vscode.window.showQuickPick(items, {
+    title: "Open independent account window",
+    placeHolder: "Select account",
+    matchOnDescription: true,
+  });
+  return picked?.ids;
 }
