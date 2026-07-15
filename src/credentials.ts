@@ -9,7 +9,11 @@ import { CredentialsFile, OAuthCreds } from "./types";
  * Switching accounts = swapping the contents of this file.
  */
 export class CredentialsManager {
-  getCredentialsPath(): string {
+  getCredentialsPath(configDir?: string): string {
+    if (configDir) {
+      return path.join(configDir, ".credentials.json");
+    }
+
     const override = vscode.workspace
       .getConfiguration("claudeSwitcher")
       .get<string>("credentialsPath", "")
@@ -18,6 +22,10 @@ export class CredentialsManager {
       return override;
     }
     return path.join(os.homedir(), ".claude", ".credentials.json");
+  }
+
+  getConfigDir(): string {
+    return path.dirname(this.getCredentialsPath());
   }
 
   exists(): boolean {
@@ -29,8 +37,8 @@ export class CredentialsManager {
   }
 
   /** Returns the claudeAiOauth object from the file, or null if missing/invalid. */
-  readCurrent(): OAuthCreds | null {
-    const p = this.getCredentialsPath();
+  readCurrent(configDir?: string): OAuthCreds | null {
+    const p = this.getCredentialsPath(configDir);
     try {
       const raw = fs.readFileSync(p, "utf8");
       const parsed = JSON.parse(raw) as Partial<CredentialsFile>;
@@ -45,9 +53,9 @@ export class CredentialsManager {
   }
 
   /** Returns the full file contents (to preserve any extra fields). */
-  private readRawFile(): CredentialsFile | null {
+  private readRawFile(configDir?: string): CredentialsFile | null {
     try {
-      const raw = fs.readFileSync(this.getCredentialsPath(), "utf8");
+      const raw = fs.readFileSync(this.getCredentialsPath(configDir), "utf8");
       return JSON.parse(raw) as CredentialsFile;
     } catch {
       return null;
@@ -58,12 +66,12 @@ export class CredentialsManager {
    * Writes creds to the file atomically (tmp -> rename), preserving any other
    * fields that were already present.
    */
-  writeCreds(creds: OAuthCreds): void {
-    const p = this.getCredentialsPath();
+  writeCreds(creds: OAuthCreds, configDir?: string): void {
+    const p = this.getCredentialsPath(configDir);
     const dir = path.dirname(p);
     fs.mkdirSync(dir, { recursive: true });
 
-    const existing = this.readRawFile() ?? ({} as CredentialsFile);
+    const existing = this.readRawFile(configDir) ?? ({} as CredentialsFile);
     const next: CredentialsFile = { ...existing, claudeAiOauth: creds };
     const json = JSON.stringify(next, null, 2);
 

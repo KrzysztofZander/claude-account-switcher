@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.0
+
+- Added independent account windows. Each account can now open the current project in a separate
+  VS Code window with its own isolated `CLAUDE_CONFIG_DIR` and `.credentials.json`.
+- Added "Say Hi" warmups for inactive saved accounts using `claude -p "Hi"` with `haiku` by default,
+  without switching the active account.
+- Added a login helper command that opens `claude auth login` in an integrated terminal.
+- Documented that Claude Code CLI is required for correct operation.
+- Documented the privacy and security model: no telemetry, no data collection, no custom backend,
+  and credentials are used only locally or with Anthropic/Claude Code endpoints required for the
+  selected feature.
+- Added Claude Code CLI auto-detection and clearer Say Hi troubleshooting when `claude` is not in
+  the VS Code extension host PATH.
+- Fixed Windows Say Hi launcher quoting for full `claude.exe` paths.
+- Made the active account marker workspace-scoped, so separate VS Code windows can track different
+  active accounts independently.
+- Added cross-window locking around token refreshes to reduce intermittent login failures from
+  rotating refresh tokens.
+- Avoided overwriting saved profiles when an unknown account is detected in the credentials file.
+- Added settings for the Claude CLI command, Say Hi model, Say Hi prompt, and Say Hi timeout.
+
 ## 0.1.0
 
 - Initial release.

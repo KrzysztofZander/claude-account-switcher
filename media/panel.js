@@ -8,6 +8,12 @@
   document.getElementById("addBtn").addEventListener("click", () => {
     vscode.postMessage({ type: "add" });
   });
+  document.getElementById("loginBtn").addEventListener("click", () => {
+    vscode.postMessage({ type: "login" });
+  });
+  document.getElementById("sayHiBtn").addEventListener("click", () => {
+    vscode.postMessage({ type: "sayHiAll" });
+  });
   document.getElementById("refreshBtn").addEventListener("click", () => {
     vscode.postMessage({ type: "refreshAll" });
   });
@@ -145,12 +151,25 @@
 
     const actions = document.createElement("div");
     actions.className = "actions";
+
+    const win = document.createElement("button");
+    win.textContent = "Window";
+    win.title = "Open this account in an independent VS Code window";
+    win.addEventListener("click", () => vscode.postMessage({ type: "openWindow", id: acc.id }));
+    actions.appendChild(win);
+
     if (!acc.isActive) {
       const sw = document.createElement("button");
       sw.className = "primary";
       sw.textContent = "Switch";
       sw.addEventListener("click", () => vscode.postMessage({ type: "switch", id: acc.id }));
       actions.appendChild(sw);
+
+      const hi = document.createElement("button");
+      hi.textContent = "Hi";
+      hi.title = "Run a one-turn Haiku warmup without switching accounts";
+      hi.addEventListener("click", () => vscode.postMessage({ type: "sayHi", id: acc.id }));
+      actions.appendChild(hi);
     }
     actions.appendChild(
       iconButton("✎", "Rename", () => vscode.postMessage({ type: "rename", id: acc.id }))

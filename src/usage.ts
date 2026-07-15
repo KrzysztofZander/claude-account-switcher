@@ -1,5 +1,6 @@
 import { AccountStore } from "./accountStore";
 import { CredentialsManager } from "./credentials";
+import { withFileLock } from "./lock";
 import { TokenRefresher } from "./oauth";
 import { OAuthCreds, UsageSnapshot, UsageWindow } from "./types";
 
@@ -187,33 +188,24 @@ export class UsagePoller {
       return;
     }
 
-    // Refresh an expired token (it rotates — save the new one).
+    // Refresh an expired token (it rotates, so save the new one).
     if (TokenRefresher.isExpired(creds)) {
-      const r = await this.refresher.refresh(creds);
-      if (r.ok && r.creds) {
-        creds = r.creds;
-        await this.store.updateCreds(id, creds);
-        // If this is the active account, also write to the file so Claude Code has a fresh token.
-        if (this.store.getActiveId() === id) {
-          try {
-            this.credentials.writeCreds(creds);
-          } catch {
-            /* ignore */
-          }
-        }
-      } else {
-        await this.store.updateUsage(id, {
-          fetchedAt: Date.now(),
-          windows: prev?.windows ?? [],
-          sessionPercent: prev?.sessionPercent ?? null,
-          weeklyPercent: prev?.weeklyPercent ?? null,
-          error: "Failed to refresh token: " + (r.error ?? "error"),
-        });
+      const refreshed = await this.refreshCreds(id, creds, false, prev);
+      if (!refreshed) {
         return;
+      }
+      creds = refreshed;
+    }
+
+    let result = await fetchUsage(creds);
+    if (result.status === 401 || result.status === 403) {
+      const refreshed = await this.refreshCreds(id, creds, true, prev);
+      if (refreshed) {
+        creds = refreshed;
+        result = await fetchUsage(creds);
       }
     }
 
-    const result = await fetchUsage(creds);
     if (result.snapshot) {
       await this.store.updateUsage(id, result.snapshot);
     } else {
@@ -226,5 +218,66 @@ export class UsagePoller {
         retryAfter: result.retryAfter,
       });
     }
+  }
+
+  private async refreshCreds(
+    id: string,
+    credsBeforeLock: OAuthCreds,
+    force: boolean,
+    prev: UsageSnapshot | undefined
+  ): Promise<OAuthCreds | null> {
+    const locked = await withFileLock(`refresh:${id}`, 10_000, async () => {
+      const latest = (await this.store.getCreds(id)) ?? credsBeforeLock;
+
+      if (!force && !TokenRefresher.isExpired(latest)) {
+        return { ok: true as const, creds: latest };
+      }
+
+      if (force && latest.accessToken !== credsBeforeLock.accessToken) {
+        return { ok: true as const, creds: latest };
+      }
+
+      const refreshed = await this.refresher.refresh(latest);
+      if (!refreshed.ok || !refreshed.creds) {
+        return {
+          ok: false as const,
+          error: "Failed to refresh token: " + (refreshed.error ?? "error"),
+        };
+      }
+
+      await this.store.updateCreds(id, refreshed.creds);
+      if (this.store.getActiveId() === id) {
+        try {
+          this.credentials.writeCreds(refreshed.creds);
+        } catch {
+          /* best effort: Claude Code can still use the stored profile on next switch */
+        }
+      }
+      return { ok: true as const, creds: refreshed.creds };
+    });
+
+    if (!locked.acquired) {
+      await this.store.updateUsage(id, {
+        fetchedAt: Date.now(),
+        windows: prev?.windows ?? [],
+        sessionPercent: prev?.sessionPercent ?? null,
+        weeklyPercent: prev?.weeklyPercent ?? null,
+        error: "Skipped token refresh because another VS Code window is refreshing it.",
+      });
+      return null;
+    }
+
+    if (!locked.value?.ok) {
+      await this.store.updateUsage(id, {
+        fetchedAt: Date.now(),
+        windows: prev?.windows ?? [],
+        sessionPercent: prev?.sessionPercent ?? null,
+        weeklyPercent: prev?.weeklyPercent ?? null,
+        error: locked.value?.error ?? "Failed to refresh token.",
+      });
+      return null;
+    }
+
+    return locked.value.creds;
   }
 }

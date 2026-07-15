@@ -8,7 +8,9 @@ const SECRET_PREFIX = "claudeSwitcher.account.";
 
 /**
  * Stores account profiles. Metadata (list, order, last usage snapshot) is kept in
- * globalState; secrets (OAuth tokens) in the encrypted SecretStorage.
+ * globalState; secrets (OAuth tokens) in the encrypted SecretStorage. The active
+ * account id is workspace-scoped so independent VS Code windows can use different
+ * accounts without racing through one global marker.
  *
  * The "active" account is the one whose tokens are currently in .credentials.json.
  * Because Claude Code rotates tokens, the source of truth is the remembered
@@ -34,11 +36,11 @@ export class AccountStore {
   }
 
   getActiveId(): string | undefined {
-    return this.context.globalState.get<string>(ACTIVE_KEY);
+    return this.context.workspaceState.get<string>(ACTIVE_KEY);
   }
 
   async setActiveId(id: string | undefined): Promise<void> {
-    await this.context.globalState.update(ACTIVE_KEY, id);
+    await this.context.workspaceState.update(ACTIVE_KEY, id);
   }
 
   private secretKey(id: string): string {
@@ -133,9 +135,13 @@ export class AccountStore {
   }
 
   /**
-   * Syncs the active profile's creds with the current file (the file is the source of
-   * truth for the active account, since Claude Code rotates tokens). If the file matches
-   * a different profile, switches activeId to that profile.
+   * Syncs the active profile's creds with the current file. If the file matches
+   * a saved profile, that profile becomes active and receives the freshest tokens.
+   *
+   * If the file does not match any saved profile, we intentionally do not overwrite the
+   * remembered active profile. That case can mean "same account rotated both tokens",
+   * but it can also mean the user manually logged in to another account. Overwriting here
+   * would destroy the stored profile and is a common cause of later login failures.
    */
   async syncActiveFromFile(fileCreds: OAuthCreds | null): Promise<void> {
     if (!fileCreds) {
@@ -147,10 +153,21 @@ export class AccountStore {
       await this.updateCreds(matched, fileCreds);
       return;
     }
-    // No match (e.g. token rotation) — refresh the remembered active profile.
     const activeId = this.getActiveId();
-    if (activeId && this.get(activeId)) {
+    const activeCreds = activeId ? await this.getCreds(activeId) : null;
+    if (
+      activeId &&
+      this.get(activeId) &&
+      activeCreds &&
+      (activeCreds.accessToken === fileCreds.accessToken ||
+        activeCreds.refreshToken === fileCreds.refreshToken)
+    ) {
       await this.updateCreds(activeId, fileCreds);
+      return;
+    }
+
+    if (activeId) {
+      await this.setActiveId(undefined);
     }
   }
 }

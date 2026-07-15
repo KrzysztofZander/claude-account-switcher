@@ -38,14 +38,28 @@ export class AccountsViewProvider implements vscode.WebviewViewProvider {
         case "switch":
           if (msg.id) void vscode.commands.executeCommand("claudeSwitcher.switchAccount", msg.id);
           break;
+        case "openWindow":
+          if (msg.id) {
+            void vscode.commands.executeCommand("claudeSwitcher.openIndependentWindow", msg.id);
+          }
+          break;
         case "refresh":
           void vscode.commands.executeCommand("claudeSwitcher.refreshUsage", msg.id);
           break;
         case "refreshAll":
           void vscode.commands.executeCommand("claudeSwitcher.refreshUsage");
           break;
+        case "sayHi":
+          if (msg.id) void vscode.commands.executeCommand("claudeSwitcher.sayHi", msg.id);
+          break;
+        case "sayHiAll":
+          void vscode.commands.executeCommand("claudeSwitcher.sayHi");
+          break;
         case "add":
           void vscode.commands.executeCommand("claudeSwitcher.addCurrentAccount");
+          break;
+        case "login":
+          void vscode.commands.executeCommand("claudeSwitcher.login");
           break;
         case "remove":
           if (msg.id) void vscode.commands.executeCommand("claudeSwitcher.removeAccount", msg.id);
@@ -112,6 +126,8 @@ export class AccountsViewProvider implements vscode.WebviewViewProvider {
 <body>
   <div id="toolbar">
     <button id="addBtn" class="primary">+ Save current account</button>
+    <button id="loginBtn" title="Open Claude login">Login</button>
+    <button id="sayHiBtn" title="Say Hi on inactive accounts">Hi</button>
     <button id="refreshBtn" title="Refresh usage limits">⟳</button>
   </div>
   <div id="list"></div>

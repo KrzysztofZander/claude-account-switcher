@@ -140,12 +140,14 @@ button.primary:hover {
 
 .actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   margin-top: 10px;
 }
 
 .actions button {
   flex: 1;
+  min-width: 58px;
 }
 
 .icon-btn {
