@@ -171,6 +171,15 @@
       hi.addEventListener("click", () => vscode.postMessage({ type: "sayHi", id: acc.id }));
       actions.appendChild(hi);
     }
+
+    if (acc.needsReauthorization) {
+      const auth = document.createElement("button");
+      auth.textContent = "Auth";
+      auth.title = "Reauthorize this profile in an isolated Claude login";
+      auth.addEventListener("click", () => vscode.postMessage({ type: "reauthorize", id: acc.id }));
+      actions.appendChild(auth);
+    }
+
     actions.appendChild(
       iconButton("✎", "Rename", () => vscode.postMessage({ type: "rename", id: acc.id }))
     );

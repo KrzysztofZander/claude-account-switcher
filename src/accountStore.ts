@@ -1,6 +1,7 @@
 import * as crypto from "crypto";
 import * as vscode from "vscode";
-import { AccountProfile, OAuthCreds, UsageSnapshot } from "./types";
+import { sameNonEmptyToken } from "./credentialValidation";
+import { AccountProfile, ClaudeAuthIdentity, OAuthCreds, UsageSnapshot } from "./types";
 
 const PROFILES_KEY = "claudeSwitcher.profiles";
 const ACTIVE_KEY = "claudeSwitcher.activeId";
@@ -108,6 +109,34 @@ export class AccountStore {
     }
   }
 
+  async updateIdentity(id: string, identity: ClaudeAuthIdentity): Promise<void> {
+    const profiles = this.profiles;
+    const p = profiles.find((x) => x.id === id);
+    if (p) {
+      p.authEmail = identity.email;
+      p.authOrgId = identity.orgId;
+      p.authOrgName = identity.orgName;
+      await this.saveProfiles(profiles);
+    }
+  }
+
+  findByIdentity(identity: ClaudeAuthIdentity, exceptId?: string): AccountProfile | undefined {
+    const email = normalizeEmail(identity.email);
+    const orgId = normalizeIdentityValue(identity.orgId);
+    if (!email && !orgId) {
+      return undefined;
+    }
+
+    return this.profiles.find((p) => {
+      if (p.id === exceptId) {
+        return false;
+      }
+      const profileOrgId = normalizeIdentityValue(p.authOrgId);
+      const profileEmail = normalizeEmail(p.authEmail);
+      return Boolean((orgId && profileOrgId === orgId) || (email && profileEmail === email));
+    });
+  }
+
   /** Overwrites a profile's tokens (e.g. after a refresh) and updates the subscription type. */
   async updateCreds(id: string, creds: OAuthCreds): Promise<void> {
     await this.setCreds(id, creds);
@@ -125,8 +154,8 @@ export class AccountStore {
       const stored = await this.getCreds(p.id);
       if (
         stored &&
-        (stored.accessToken === creds.accessToken ||
-          stored.refreshToken === creds.refreshToken)
+        (sameNonEmptyToken(stored.accessToken, creds.accessToken) ||
+          sameNonEmptyToken(stored.refreshToken, creds.refreshToken))
       ) {
         return p.id;
       }
@@ -159,8 +188,8 @@ export class AccountStore {
       activeId &&
       this.get(activeId) &&
       activeCreds &&
-      (activeCreds.accessToken === fileCreds.accessToken ||
-        activeCreds.refreshToken === fileCreds.refreshToken)
+      (sameNonEmptyToken(activeCreds.accessToken, fileCreds.accessToken) ||
+        sameNonEmptyToken(activeCreds.refreshToken, fileCreds.refreshToken))
     ) {
       await this.updateCreds(activeId, fileCreds);
       return;
@@ -170,4 +199,13 @@ export class AccountStore {
       await this.setActiveId(undefined);
     }
   }
+}
+
+function normalizeEmail(value: string | undefined): string | undefined {
+  return normalizeIdentityValue(value)?.toLowerCase();
+}
+
+function normalizeIdentityValue(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
 }

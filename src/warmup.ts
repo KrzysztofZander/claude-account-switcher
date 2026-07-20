@@ -8,6 +8,7 @@ import {
   missingClaudeCliMessage,
   resolveClaudeCommand,
 } from "./cli";
+import { hasUsableOAuthCreds } from "./credentialValidation";
 import { CredentialsManager } from "./credentials";
 import { getAccountConfigDir } from "./isolatedConfig";
 import { withFileLock } from "./lock";
@@ -55,9 +56,23 @@ export class WarmupService {
     if (!creds) {
       return { ok: false, message: `No stored credentials for "${profile.label}".` };
     }
+    if (!hasUsableOAuthCreds(creds)) {
+      return {
+        ok: false,
+        message:
+          `"${profile.label}" needs reauthorization. Use "Claude: Reauthorize account profile" for this profile first.`,
+      };
+    }
 
     const locked = await withFileLock(`warmup:${id}`, 30_000, async () => {
       const latestCreds = (await this.store.getCreds(id)) ?? creds;
+      if (!hasUsableOAuthCreds(latestCreds)) {
+        return {
+          ok: false,
+          message:
+            `"${profile.label}" needs reauthorization. Use "Claude: Reauthorize account profile" for this profile first.`,
+        };
+      }
       const configDir = this.getProfileConfigDir(id);
       fs.mkdirSync(configDir, { recursive: true });
       this.credentials.writeCreds(latestCreds, configDir);

@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 import { AccountStore } from "./accountStore";
+import { hasUsableOAuthCreds } from "./credentialValidation";
 import { CredentialsManager } from "./credentials";
 import { getAccountConfigDir } from "./isolatedConfig";
 
@@ -40,6 +41,13 @@ export class AccountWindowService {
     const creds = await this.store.getCreds(id);
     if (!creds) {
       return { ok: false, message: `No stored credentials for "${profile.label}".` };
+    }
+    if (!hasUsableOAuthCreds(creds)) {
+      return {
+        ok: false,
+        message:
+          `"${profile.label}" needs reauthorization. Use "Claude: Reauthorize account profile" for this profile first.`,
+      };
     }
 
     const configDir = getAccountConfigDir(this.context, id);

@@ -1,6 +1,13 @@
 import * as vscode from "vscode";
 import { AccountStore } from "./accountStore";
+import { hasUsableOAuthCreds } from "./credentialValidation";
 import { CredentialsManager } from "./credentials";
+
+export interface SwitchResult {
+  ok: boolean;
+  message: string;
+  reauthProfileId?: string;
+}
 
 /**
  * Orchestration: capturing the current account, switching (swapping the file),
@@ -22,14 +29,22 @@ export class SwitchService {
           "No logged-in account found in .credentials.json. Log in to Claude Code and try again.",
       };
     }
+    if (!hasUsableOAuthCreds(creds)) {
+      return {
+        ok: false,
+        message:
+          "Current Claude credentials are incomplete. Run Claude: Log in from terminal, finish login, then save the account again.",
+      };
+    }
 
     const existingId = await this.store.findByTokens(creds);
     if (existingId) {
       const existing = this.store.get(existingId);
       await this.store.setActiveId(existingId);
+      await this.store.updateCreds(existingId, creds);
       return {
-        ok: false,
-        message: `This account is already saved as "${existing?.label ?? existingId}".`,
+        ok: true,
+        message: `Updated saved profile "${existing?.label ?? existingId}".`,
       };
     }
 
@@ -51,17 +66,22 @@ export class SwitchService {
   }
 
   /** Switches to the given profile: backup + write to file + (optionally) reload. */
-  async switchTo(id: string): Promise<{ ok: boolean; message: string }> {
+  async switchTo(id: string): Promise<SwitchResult> {
     const profile = this.store.get(id);
     if (!profile) {
       return { ok: false, message: "Profile not found." };
     }
+    const creds = await this.store.getCreds(id);
+    if (!creds || !hasUsableOAuthCreds(creds)) {
+      return {
+        ok: false,
+        message:
+          `"${profile.label}" needs reauthorization. Its stored credentials are incomplete, so it was not written to Claude Code.`,
+        reauthProfileId: id,
+      };
+    }
     if (this.store.getActiveId() === id) {
       return { ok: false, message: `"${profile.label}" is already active.` };
-    }
-    const creds = await this.store.getCreds(id);
-    if (!creds) {
-      return { ok: false, message: "No stored credentials for this profile." };
     }
 
     this.credentials.backupCurrent();

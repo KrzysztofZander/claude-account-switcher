@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { AccountStore } from "../accountStore";
+import { hasUsableOAuthCreds } from "../credentialValidation";
 
 interface ViewAccount {
   id: string;
@@ -10,6 +11,7 @@ interface ViewAccount {
   error?: string;
   fetchedAt?: number;
   retryAfter?: number;
+  needsReauthorization: boolean;
 }
 
 /** Activity bar panel: list of accounts with usage limits and actions. */
@@ -61,6 +63,11 @@ export class AccountsViewProvider implements vscode.WebviewViewProvider {
         case "login":
           void vscode.commands.executeCommand("claudeSwitcher.login");
           break;
+        case "reauthorize":
+          if (msg.id) {
+            void vscode.commands.executeCommand("claudeSwitcher.reauthorizeProfile", msg.id);
+          }
+          break;
         case "remove":
           if (msg.id) void vscode.commands.executeCommand("claudeSwitcher.removeAccount", msg.id);
           break;
@@ -82,21 +89,30 @@ export class AccountsViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     const activeId = this.store.getActiveId();
-    const accounts: ViewAccount[] = this.store.list().map((p) => ({
-      id: p.id,
-      label: p.label,
-      subscriptionType: p.subscriptionType,
-      isActive: p.id === activeId,
-      windows: p.lastUsage?.windows ?? [],
-      error: p.lastUsage?.error,
-      fetchedAt: p.lastUsage?.fetchedAt,
-      retryAfter: p.lastUsage?.retryAfter,
-    }));
+    const profiles = this.store.list();
     const warnThreshold = vscode.workspace
       .getConfiguration("claudeSwitcher")
       .get<number>("warnThresholdPercent", 80);
 
-    void this.view.webview.postMessage({ type: "state", accounts, warnThreshold });
+    void Promise.all(
+      profiles.map(async (p): Promise<ViewAccount> => {
+        const creds = await this.store.getCreds(p.id);
+        const error = p.lastUsage?.error;
+        return {
+          id: p.id,
+          label: p.label,
+          subscriptionType: p.subscriptionType,
+          isActive: p.id === activeId,
+          windows: p.lastUsage?.windows ?? [],
+          error,
+          fetchedAt: p.lastUsage?.fetchedAt,
+          retryAfter: p.lastUsage?.retryAfter,
+          needsReauthorization: !hasUsableOAuthCreds(creds) || isAuthProblem(error),
+        };
+      })
+    ).then((accounts) => {
+      void this.view?.webview.postMessage({ type: "state", accounts, warnThreshold });
+    });
   }
 
   private getHtml(webview: vscode.Webview): string {
@@ -139,6 +155,21 @@ export class AccountsViewProvider implements vscode.WebviewViewProvider {
 </body>
 </html>`;
   }
+}
+
+function isAuthProblem(error: string | undefined): boolean {
+  const text = error?.toLowerCase() ?? "";
+  return (
+    text.includes("failed to refresh token") ||
+    text.includes("refresh token") ||
+    text.includes("reauthoriz") ||
+    text.includes("unauthorized") ||
+    text.includes("forbidden") ||
+    text.includes("invalid_request_error") ||
+    text.includes("invalid_grant") ||
+    text.includes("http 401") ||
+    text.includes("http 403")
+  );
 }
 
 function getNonce(): string {

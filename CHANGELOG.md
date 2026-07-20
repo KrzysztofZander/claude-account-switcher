@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.2
+
+- Added independent account windows, Say Hi warmups, and safer cross-window token-refresh locking.
+- Added isolated profile reauthorization for broken accounts. The fallback login runs in that
+  profile's own `CLAUDE_CONFIG_DIR`, so another active account cannot overwrite it.
+- Added account identity checks through `claude auth status --json`; reauthorization is rejected if
+  the completed login belongs to a different known profile.
+- Hardened credential handling so empty or incomplete OAuth credentials are ignored and never
+  written to Claude Code.
+- Updated Claude OAuth refresh requests with the current beta header, default Claude Code scopes,
+  and clearer local validation before hitting the token endpoint.
+- Show the panel's `Auth` action only for profiles that actually need reauthorization.
+- Improved CLI discovery, Windows command quoting, and troubleshooting for login and warmup flows.
+
 ## 0.2.1
 
 - Fixed token refresh to use the current Claude Code OAuth token endpoint and include saved scopes

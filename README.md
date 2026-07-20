@@ -21,6 +21,8 @@ and re-login.
 - **Independent account windows** — open the same project in separate VS Code windows, each
   with its own Claude account and `CLAUDE_CONFIG_DIR`.
 - **Login helper** — opens an integrated terminal with `claude auth login`.
+- **Isolated reauthorization** — if a saved profile's credentials break, re-login happens in
+  that profile's own `CLAUDE_CONFIG_DIR` instead of copying the currently active account.
 - **Status bar** — the active account and its usage % always in view.
 
 ## Requirements
@@ -70,6 +72,8 @@ irm https://claude.ai/install.ps1 | iex
 | `Claude: Say Hi on account` | warms up inactive saved accounts via `claude -p` |
 | `Claude: Open independent account window` | opens this project in a new VS Code window scoped to one account |
 | `Claude: Log in from terminal` | opens `claude auth login` in an integrated terminal |
+| `Claude: Reauthorize account profile` | opens isolated login for a saved profile without touching the active account |
+| `Claude: Complete profile reauthorization` | imports the completed isolated login into that same profile |
 | `Claude: Undo last switch` | restores the previous account from `.bak` |
 | `Claude: Remove / Rename account profile` | manage profiles |
 

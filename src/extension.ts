@@ -1,19 +1,22 @@
 import * as vscode from "vscode";
 import { AccountStore } from "./accountStore";
 import { AccountWindowService } from "./accountWindow";
+import { readClaudeAuthStatus } from "./authStatus";
 import {
   getConfiguredClaudeCommand,
   missingClaudeCliMessage,
   quoteForTerminal,
   resolveClaudeCommand,
 } from "./cli";
+import { hasUsableOAuthCreds } from "./credentialValidation";
 import { CredentialsManager } from "./credentials";
+import { getAccountConfigDir } from "./isolatedConfig";
 import { TokenRefresher } from "./oauth";
 import { SwitchService } from "./switchService";
 import { AccountsViewProvider } from "./ui/accountsView";
 import { StatusBarController } from "./ui/statusBar";
 import { UsagePoller } from "./usage";
-import { AccountProfile } from "./types";
+import { AccountProfile, ClaudeAuthIdentity } from "./types";
 import { WarmupService } from "./warmup";
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -34,7 +37,145 @@ export function activate(context: vscode.ExtensionContext): void {
     viewProvider.refresh();
   };
 
-  const poller = new UsagePoller(store, refresher, credentials, getInterval, refreshUI);
+  const openClaudeLogin = (options?: { configDir?: string; terminalName?: string }) => {
+    const configuredCommand = getConfiguredClaudeCommand();
+    const resolvedCommand = resolveClaudeCommand(configuredCommand);
+    if (!resolvedCommand) {
+      vscode.window.showWarningMessage(missingClaudeCliMessage());
+    }
+
+    const command = resolvedCommand ?? configuredCommand;
+    const terminal = vscode.window.createTerminal({
+      name: options?.terminalName ?? "Claude Login",
+      env: options?.configDir ? { CLAUDE_CONFIG_DIR: options.configDir } : undefined,
+    });
+    terminal.show();
+    terminal.sendText(`${quoteForTerminal(command)} auth login`);
+  };
+
+  const backfillKnownIdentities = async () => {
+    for (const profile of store.list()) {
+      if (profileHasIdentity(profile)) {
+        continue;
+      }
+      const configDir = getAccountConfigDir(context, profile.id);
+      if (!hasUsableOAuthCreds(credentials.readCurrent(configDir))) {
+        continue;
+      }
+      const status = await readClaudeAuthStatus(configDir);
+      if (status.ok && status.status?.loggedIn) {
+        await store.updateIdentity(profile.id, status.status);
+      }
+    }
+
+    const activeId = store.getActiveId();
+    const activeProfile = activeId ? store.get(activeId) : undefined;
+    if (activeId && activeProfile && !profileHasIdentity(activeProfile)) {
+      const status = await readClaudeAuthStatus();
+      if (status.ok && status.status?.loggedIn) {
+        await store.updateIdentity(activeId, status.status);
+      }
+    }
+  };
+
+  const completeProfileReauthorization = async (
+    id: string,
+    silentWhenMissing = false
+  ): Promise<{ ok: boolean; message: string; missing?: boolean }> => {
+    const profile = store.get(id);
+    if (!profile) {
+      return { ok: false, message: "Profile not found." };
+    }
+
+    const configDir = getAccountConfigDir(context, id);
+    const creds = credentials.readCurrent(configDir);
+    if (!creds || !hasUsableOAuthCreds(creds)) {
+      return {
+        ok: false,
+        missing: silentWhenMissing,
+        message: `No completed isolated login found for "${profile.label}" yet.`,
+      };
+    }
+
+    const status = await readClaudeAuthStatus(configDir);
+    if (!status.ok || !status.status?.loggedIn) {
+      return {
+        ok: false,
+        message:
+          `Could not verify the isolated login for "${profile.label}": ` +
+          (status.error ?? "Claude auth status did not report a logged-in account."),
+      };
+    }
+
+    await backfillKnownIdentities();
+    const latestProfile = store.get(id) ?? profile;
+    const conflict = store.findByIdentity(status.status, id);
+    if (conflict) {
+      return {
+        ok: false,
+        message:
+          `The isolated login belongs to "${conflict.label}" (${identityLabel(status.status)}). ` +
+          `"${profile.label}" was not overwritten.`,
+      };
+    }
+
+    const previousIdentity = profileIdentity(latestProfile);
+    if (previousIdentity && !sameIdentity(previousIdentity, status.status)) {
+      return {
+        ok: false,
+        message:
+          `The isolated login identity (${identityLabel(status.status)}) does not match ` +
+          `"${profile.label}" (${identityLabel(previousIdentity)}). The profile was not overwritten.`,
+      };
+    }
+
+    await store.updateCreds(id, creds);
+    await store.updateIdentity(id, status.status);
+    return {
+      ok: true,
+      message: `Reauthorized "${profile.label}" as ${identityLabel(status.status)}.`,
+    };
+  };
+
+  const startProfileReauthorization = async (id: string) => {
+    const profile = store.get(id);
+    if (!profile) {
+      vscode.window.showWarningMessage("Profile not found.");
+      return;
+    }
+
+    const configDir = getAccountConfigDir(context, id);
+    try {
+      credentials.moveCredentialsAside(configDir, "reauth-backup");
+    } catch (e) {
+      vscode.window.showWarningMessage((e as Error).message);
+      return;
+    }
+
+    openClaudeLogin({
+      configDir,
+      terminalName: `Claude Login: ${profile.label}`,
+    });
+
+    const choice = await vscode.window.showInformationMessage(
+      `Started isolated login for "${profile.label}". This does not change the current Claude Code account. Finish the login, then complete the reauthorization.`,
+      "Complete reauthorization"
+    );
+    if (choice === "Complete reauthorization") {
+      const res = await completeProfileReauthorization(id);
+      vscode.window[res.ok ? "showInformationMessage" : "showWarningMessage"](res.message);
+      refreshUI();
+    }
+  };
+
+  const poller = new UsagePoller(
+    store,
+    refresher,
+    credentials,
+    getInterval,
+    refreshUI,
+    (id) => credentials.readCurrent(getAccountConfigDir(context, id))
+  );
 
   // On startup: sync the active account from the file and render the state.
   void store.syncActiveFromFile(credentials.readCurrent()).then(refreshUI);
@@ -67,9 +208,39 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!targetId) {
         return;
       }
-      const res = await switchService.switchTo(targetId);
+      let res = await switchService.switchTo(targetId);
+      if (!res.ok && res.reauthProfileId) {
+        const completed = await completeProfileReauthorization(res.reauthProfileId, true);
+        if (completed.ok) {
+          res = await switchService.switchTo(targetId);
+        } else if (!completed.missing) {
+          vscode.window.showWarningMessage(completed.message);
+        }
+      }
       if (!res.ok) {
-        vscode.window.showWarningMessage(res.message);
+        if (res.reauthProfileId) {
+          const choice = await vscode.window.showWarningMessage(
+            `${res.message} Reauthorize this profile in an isolated Claude login so another saved account cannot overwrite it.`,
+            "Reauthorize profile",
+            "Complete reauthorization"
+          );
+          if (choice === "Reauthorize profile") {
+            await startProfileReauthorization(res.reauthProfileId);
+          } else if (choice === "Complete reauthorization") {
+            const completed = await completeProfileReauthorization(res.reauthProfileId);
+            vscode.window[completed.ok ? "showInformationMessage" : "showWarningMessage"](
+              completed.message
+            );
+            if (completed.ok) {
+              res = await switchService.switchTo(targetId);
+              if (!res.ok) {
+                vscode.window.showWarningMessage(res.message);
+              }
+            }
+          }
+        } else {
+          vscode.window.showWarningMessage(res.message);
+        }
       }
       refreshUI();
     })
@@ -119,18 +290,44 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("claudeSwitcher.login", () => {
-      const configuredCommand = getConfiguredClaudeCommand();
-      const resolvedCommand = resolveClaudeCommand(configuredCommand);
-      if (!resolvedCommand) {
-        vscode.window.showWarningMessage(missingClaudeCliMessage());
-      }
+    vscode.commands.registerCommand("claudeSwitcher.login", openClaudeLogin)
+  );
 
-      const command = resolvedCommand ?? configuredCommand;
-      const terminal = vscode.window.createTerminal({ name: "Claude Login" });
-      terminal.show();
-      terminal.sendText(`${quoteForTerminal(command)} auth login`);
+  context.subscriptions.push(
+    vscode.commands.registerCommand("claudeSwitcher.reauthorizeProfile", async (id?: string) => {
+      const targetId = id ?? (await pickAccount(store, "Reauthorize profile..."));
+      if (targetId) {
+        await startProfileReauthorization(targetId);
+      }
     })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "claudeSwitcher.completeProfileReauthorization",
+      async (id?: string) => {
+        const targetId = id ?? (await pickAccount(store, "Complete profile reauthorization..."));
+        if (!targetId) {
+          return;
+        }
+        const res = await completeProfileReauthorization(targetId);
+        vscode.window[res.ok ? "showInformationMessage" : "showWarningMessage"](res.message);
+        if (res.ok) {
+          const profile = store.get(targetId);
+          const choice = await vscode.window.showInformationMessage(
+            `Switch to "${profile?.label ?? targetId}" now?`,
+            "Switch now"
+          );
+          if (choice === "Switch now") {
+            const switched = await switchService.switchTo(targetId);
+            vscode.window[switched.ok ? "showInformationMessage" : "showWarningMessage"](
+              switched.message
+            );
+          }
+        }
+        refreshUI();
+      }
+    )
   );
 
   context.subscriptions.push(
@@ -306,4 +503,45 @@ async function pickWindowTargets(store: AccountStore): Promise<string[] | undefi
     matchOnDescription: true,
   });
   return picked?.ids;
+}
+
+function profileHasIdentity(profile: AccountProfile): boolean {
+  return Boolean(profileIdentity(profile));
+}
+
+function profileIdentity(profile: AccountProfile): ClaudeAuthIdentity | undefined {
+  const email = normalizeEmail(profile.authEmail);
+  const orgId = normalizeIdentityValue(profile.authOrgId);
+  if (!email && !orgId) {
+    return undefined;
+  }
+  return {
+    email: profile.authEmail,
+    orgId: profile.authOrgId,
+    orgName: profile.authOrgName,
+  };
+}
+
+function sameIdentity(a: ClaudeAuthIdentity, b: ClaudeAuthIdentity): boolean {
+  const aOrgId = normalizeIdentityValue(a.orgId);
+  const bOrgId = normalizeIdentityValue(b.orgId);
+  if (aOrgId && bOrgId) {
+    return aOrgId === bOrgId;
+  }
+  const aEmail = normalizeEmail(a.email);
+  const bEmail = normalizeEmail(b.email);
+  return Boolean(aEmail && bEmail && aEmail === bEmail);
+}
+
+function identityLabel(identity: ClaudeAuthIdentity): string {
+  return identity.email ?? identity.orgName ?? identity.orgId ?? "unknown account";
+}
+
+function normalizeEmail(value: string | undefined): string | undefined {
+  return normalizeIdentityValue(value)?.toLowerCase();
+}
+
+function normalizeIdentityValue(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
 }

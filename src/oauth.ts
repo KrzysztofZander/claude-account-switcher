@@ -10,6 +10,14 @@ import { OAuthCreds } from "./types";
  */
 const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const OAUTH_BETA = "oauth-2025-04-20";
+const DEFAULT_SCOPES = [
+  "user:profile",
+  "user:inference",
+  "user:sessions:claude_code",
+  "user:mcp_servers",
+  "user:file_upload",
+];
 
 export interface RefreshResult {
   ok: boolean;
@@ -21,30 +29,39 @@ export interface RefreshResult {
 export class TokenRefresher {
   async refresh(creds: OAuthCreds): Promise<RefreshResult> {
     try {
+      if (!isNonEmptyString(creds.refreshToken)) {
+        return {
+          ok: false,
+          error:
+            "Stored profile has no refresh token. Reauthorize this account profile.",
+        };
+      }
+
       const payload: Record<string, string> = {
         grant_type: "refresh_token",
         refresh_token: creds.refreshToken,
         client_id: creds.clientId ?? CLIENT_ID,
+        scope: normalizeScopes(creds.scopes).join(" "),
       };
-      if (Array.isArray(creds.scopes) && creds.scopes.length > 0) {
-        payload.scope = creds.scopes.join(" ");
-      }
 
       const res = await fetch(TOKEN_URL, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Accept: "application/json",
+          "anthropic-beta": OAUTH_BETA,
+          "User-Agent": "claude-code-account-switcher",
         },
         body: JSON.stringify(payload),
       });
 
       if (!res.ok) {
         const body = await res.text().catch(() => "");
+        const sentFields = Object.keys(payload).join(", ");
         return {
           ok: false,
           status: res.status,
-          error: `HTTP ${res.status}: ${body.slice(0, 200)}`,
+          error: `HTTP ${res.status} from token endpoint (sent fields: ${sentFields}): ${body.slice(0, 200)}`,
         };
       }
 
@@ -82,4 +99,16 @@ export class TokenRefresher {
   static isExpired(creds: OAuthCreds): boolean {
     return typeof creds.expiresAt === "number" && creds.expiresAt - 60_000 < Date.now();
   }
+}
+
+function normalizeScopes(scopes: unknown): string[] {
+  if (!Array.isArray(scopes)) {
+    return DEFAULT_SCOPES;
+  }
+  const normalized = scopes.filter(isNonEmptyString);
+  return normalized.length > 0 ? normalized : DEFAULT_SCOPES;
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
 }

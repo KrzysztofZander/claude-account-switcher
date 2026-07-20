@@ -2,6 +2,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
+import { hasAccessToken, hasUsableOAuthCreds } from "./credentialValidation";
 import { CredentialsFile, OAuthCreds } from "./types";
 
 /**
@@ -43,7 +44,7 @@ export class CredentialsManager {
       const raw = fs.readFileSync(p, "utf8");
       const parsed = JSON.parse(raw) as Partial<CredentialsFile>;
       const oauth = parsed.claudeAiOauth;
-      if (oauth && typeof oauth.accessToken === "string") {
+      if (hasAccessToken(oauth)) {
         return oauth as OAuthCreds;
       }
       return null;
@@ -67,6 +68,10 @@ export class CredentialsManager {
    * fields that were already present.
    */
   writeCreds(creds: OAuthCreds, configDir?: string): void {
+    if (!hasUsableOAuthCreds(creds)) {
+      throw new Error("Refusing to write incomplete Claude OAuth credentials.");
+    }
+
     const p = this.getCredentialsPath(configDir);
     const dir = path.dirname(p);
     fs.mkdirSync(dir, { recursive: true });
@@ -124,5 +129,22 @@ export class CredentialsManager {
       /* ignore */
     }
     return false;
+  }
+
+  /** Moves an existing credentials file out of the way before a forced repair login. */
+  moveCredentialsAside(configDir?: string, reason = "backup"): string | null {
+    const p = this.getCredentialsPath(configDir);
+    try {
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      if (!fs.existsSync(p)) {
+        return null;
+      }
+      const stamp = new Date().toISOString().replace(/\D/g, "").slice(0, 14);
+      const target = `${p}.${reason}-${stamp}`;
+      fs.renameSync(p, target);
+      return target;
+    } catch (e) {
+      throw new Error("Failed to move existing credentials aside: " + (e as Error).message);
+    }
   }
 }

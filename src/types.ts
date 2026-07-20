@@ -15,6 +15,12 @@ export interface OAuthCreds {
   rateLimitTier?: string;
 }
 
+export interface ClaudeAuthIdentity {
+  email?: string;
+  orgId?: string;
+  orgName?: string;
+}
+
 export interface CredentialsFile {
   claudeAiOauth: OAuthCreds;
   [key: string]: unknown;
@@ -25,6 +31,9 @@ export interface AccountProfile {
   id: string;
   label: string;
   subscriptionType?: string;
+  authEmail?: string;
+  authOrgId?: string;
+  authOrgName?: string;
   addedAt: number;
   order: number;
   /** last read usage snapshot (cached for fast rendering) */

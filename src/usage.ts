@@ -1,4 +1,5 @@
 import { AccountStore } from "./accountStore";
+import { hasUsableOAuthCreds, sameNonEmptyToken } from "./credentialValidation";
 import { CredentialsManager } from "./credentials";
 import { withFileLock } from "./lock";
 import { TokenRefresher } from "./oauth";
@@ -138,7 +139,8 @@ export class UsagePoller {
     private readonly refresher: TokenRefresher,
     private readonly credentials: CredentialsManager,
     private readonly getIntervalSeconds: () => number,
-    private readonly onUpdate: () => void
+    private readonly onUpdate: () => void,
+    private readonly readProfileCreds?: (id: string) => OAuthCreds | null
   ) {}
 
   start(): void {
@@ -187,6 +189,7 @@ export class UsagePoller {
     if (!creds) {
       return;
     }
+    creds = await this.syncProfileConfigCreds(id, creds);
 
     // Refresh an expired token (it rotates, so save the new one).
     if (TokenRefresher.isExpired(creds)) {
@@ -227,7 +230,8 @@ export class UsagePoller {
     prev: UsageSnapshot | undefined
   ): Promise<OAuthCreds | null> {
     const locked = await withFileLock(`refresh:${id}`, 10_000, async () => {
-      const latest = (await this.store.getCreds(id)) ?? credsBeforeLock;
+      const stored = (await this.store.getCreds(id)) ?? credsBeforeLock;
+      const latest = await this.syncProfileConfigCreds(id, stored);
 
       if (!force && !TokenRefresher.isExpired(latest)) {
         return { ok: true as const, creds: latest };
@@ -280,4 +284,45 @@ export class UsagePoller {
 
     return locked.value.creds;
   }
+
+  private async syncProfileConfigCreds(
+    id: string,
+    stored: OAuthCreds
+  ): Promise<OAuthCreds> {
+    const fileCreds = this.readProfileCreds?.(id);
+    if (!fileCreds) {
+      return stored;
+    }
+
+    if (!shouldPreferProfileFileCreds(fileCreds, stored)) {
+      return stored;
+    }
+
+    await this.store.updateCreds(id, fileCreds);
+    return fileCreds;
+  }
+}
+
+function shouldPreferProfileFileCreds(fileCreds: OAuthCreds, stored: OAuthCreds): boolean {
+  if (!hasUsableOAuthCreds(fileCreds)) {
+    return false;
+  }
+  if (!hasUsableOAuthCreds(stored)) {
+    return false;
+  }
+
+  if (
+    sameNonEmptyToken(fileCreds.accessToken, stored.accessToken) ||
+    sameNonEmptyToken(fileCreds.refreshToken, stored.refreshToken)
+  ) {
+    return true;
+  }
+
+  const fileFreshness = Math.max(timestamp(fileCreds.expiresAt), timestamp(fileCreds.refreshTokenExpiresAt));
+  const storedFreshness = Math.max(timestamp(stored.expiresAt), timestamp(stored.refreshTokenExpiresAt));
+  return fileFreshness > storedFreshness;
+}
+
+function timestamp(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
