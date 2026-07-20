@@ -3,6 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import { parseUsage } from "../src/usage";
 import { CredentialsManager } from "../src/credentials";
+import { TokenRefresher } from "../src/oauth";
 
 let failures = 0;
 function check(name: string, cond: boolean): void {
@@ -62,5 +63,61 @@ check("preserves extra fields on write", rawAfter.otherField === 123 && rawAfter
 
 fs.rmSync(tmpDir, { recursive: true, force: true });
 
-console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`);
-process.exit(failures === 0 ? 0 : 1);
+async function runTokenRefresherTests(): Promise<void> {
+  console.log("TokenRefresher:");
+  const originalFetch = globalThis.fetch;
+  let capturedUrl = "";
+  let capturedInit: RequestInit | undefined;
+
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    capturedUrl = String(input);
+    capturedInit = init;
+    return new Response(
+      JSON.stringify({
+        access_token: "next-access",
+        refresh_token: "next-refresh",
+        expires_in: 3600,
+        refresh_token_expires_in: 7200,
+        scope: "user:profile user:inference",
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+  }) as typeof fetch;
+
+  try {
+    const before = Date.now();
+    const refreshed = await new TokenRefresher().refresh({
+      accessToken: "old-access",
+      refreshToken: "old-refresh",
+      expiresAt: 111,
+      refreshTokenExpiresAt: 222,
+      scopes: ["user:profile", "user:inference"],
+      clientId: "custom-client",
+    });
+    const body = JSON.parse(String(capturedInit?.body));
+    const headers = capturedInit?.headers as Record<string, string>;
+
+    check("uses current Claude Code token endpoint", capturedUrl === "https://platform.claude.com/v1/oauth/token");
+    check("sends JSON token refresh body", headers["Content-Type"] === "application/json");
+    check("includes grant type", body.grant_type === "refresh_token");
+    check("includes refresh token", body.refresh_token === "old-refresh");
+    check("uses credential clientId when present", body.client_id === "custom-client");
+    check("includes credential scopes", body.scope === "user:profile user:inference");
+    check("stores rotated access token", refreshed.creds?.accessToken === "next-access");
+    check("stores rotated refresh token", refreshed.creds?.refreshToken === "next-refresh");
+    check("stores refresh token expiry", (refreshed.creds?.refreshTokenExpiresAt ?? 0) >= before + 7_199_000);
+    check("updates response scopes", refreshed.creds?.scopes.join(" ") === "user:profile user:inference");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+runTokenRefresherTests()
+  .then(() => {
+    console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`);
+    process.exit(failures === 0 ? 0 : 1);
+  })
+  .catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });

@@ -2,7 +2,7 @@
   "name": "claude-code-account-switcher",
   "displayName": "Claude Multi-Account Switcher",
   "description": "Quickly switch between Claude accounts (subscriptions) in Claude Code, with live usage limits.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "KrzysztofZander",
   "author": {
     "name": "Krzysztof Zander",

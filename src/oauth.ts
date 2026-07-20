@@ -8,7 +8,7 @@ import { OAuthCreds } from "./types";
  * token is single-use (it rotates) — the caller MUST persist the returned new refresh
  * token back to the profile.
  */
-const TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
+const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 export interface RefreshResult {
@@ -21,17 +21,22 @@ export interface RefreshResult {
 export class TokenRefresher {
   async refresh(creds: OAuthCreds): Promise<RefreshResult> {
     try {
+      const payload: Record<string, string> = {
+        grant_type: "refresh_token",
+        refresh_token: creds.refreshToken,
+        client_id: creds.clientId ?? CLIENT_ID,
+      };
+      if (Array.isArray(creds.scopes) && creds.scopes.length > 0) {
+        payload.scope = creds.scopes.join(" ");
+      }
+
       const res = await fetch(TOKEN_URL, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Accept: "application/json",
         },
-        body: JSON.stringify({
-          grant_type: "refresh_token",
-          refresh_token: creds.refreshToken,
-          client_id: CLIENT_ID,
-        }),
+        body: JSON.stringify(payload),
       });
 
       if (!res.ok) {
@@ -46,6 +51,7 @@ export class TokenRefresher {
       const data = (await res.json()) as {
         access_token?: string;
         refresh_token?: string;
+        refresh_token_expires_in?: number;
         expires_in?: number;
         scope?: string;
       };
@@ -58,10 +64,13 @@ export class TokenRefresher {
         ...creds,
         accessToken: data.access_token,
         refreshToken: data.refresh_token ?? creds.refreshToken,
+        refreshTokenExpiresAt: data.refresh_token_expires_in
+          ? Date.now() + data.refresh_token_expires_in * 1000
+          : creds.refreshTokenExpiresAt,
         expiresAt: data.expires_in
           ? Date.now() + data.expires_in * 1000
           : creds.expiresAt,
-        scopes: data.scope ? data.scope.split(/\s+/) : creds.scopes,
+        scopes: data.scope ? data.scope.split(/\s+/).filter(Boolean) : creds.scopes,
       };
       return { ok: true, creds: next };
     } catch (e) {

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1
+
+- Fixed token refresh to use the current Claude Code OAuth token endpoint and include saved scopes
+  in the refresh request.
+
 ## 0.2.0
 
 - Added independent account windows. Each account can now open the current project in a separate

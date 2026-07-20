@@ -7,7 +7,10 @@ export interface OAuthCreds {
   refreshToken: string;
   /** epoch ms when the accessToken expires */
   expiresAt: number;
+  /** epoch ms when the refreshToken expires */
+  refreshTokenExpiresAt?: number;
   scopes: string[];
+  clientId?: string;
   subscriptionType?: string;
   rateLimitTier?: string;
 }
