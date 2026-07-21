@@ -2,7 +2,7 @@ import { AccountStore } from "./accountStore";
 import { hasUsableOAuthCreds, sameNonEmptyToken } from "./credentialValidation";
 import { CredentialsManager } from "./credentials";
 import { withFileLock } from "./lock";
-import { TokenRefresher } from "./oauth";
+import { requiresProfileReauthorization, TokenRefresher } from "./oauth";
 import { OAuthCreds, UsageSnapshot, UsageWindow } from "./types";
 
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
@@ -182,6 +182,9 @@ export class UsagePoller {
     // Backoff: if we recently got a 429, do not retry (unless forced).
     const prev = profile.lastUsage;
     if (!force && prev?.retryAfter && prev.retryAfter > Date.now()) {
+      return;
+    }
+    if (requiresProfileReauthorization(prev?.error)) {
       return;
     }
 

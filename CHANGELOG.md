@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.3
+
+- Treat OAuth `invalid_grant` / invalid refresh-token responses as a reauthorization-needed
+  state instead of a retryable usage-refresh failure.
+- Stop automatic and manual usage refreshes from repeatedly retrying profiles that are already
+  known to need reauthorization, reducing repeated "Failed to refresh token" noise.
+- Clear stale usage errors and retry backoff automatically when a profile receives fresh
+  credentials after reauthorization or a successful token update.
+- Use the same per-account lock for Say Hi warmups and usage token refreshes, reducing refresh
+  token races between background polling, warmups, and independent VS Code windows.
+- Show a short "Needs reauthorization" message in the panel and status tooltip instead of the raw
+  token endpoint error payload.
+
 ## 0.2.2
 
 - Added independent account windows, Say Hi warmups, and safer cross-window token-refresh locking.

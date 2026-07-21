@@ -131,6 +131,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
     await store.updateCreds(id, creds);
     await store.updateIdentity(id, status.status);
+    await store.clearUsageError(id);
     return {
       ok: true,
       message: `Reauthorized "${profile.label}" as ${identityLabel(status.status)}.`,

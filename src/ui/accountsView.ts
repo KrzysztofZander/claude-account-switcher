@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { AccountStore } from "../accountStore";
 import { hasUsableOAuthCreds } from "../credentialValidation";
+import { requiresProfileReauthorization } from "../oauth";
 
 interface ViewAccount {
   id: string;
@@ -98,16 +99,17 @@ export class AccountsViewProvider implements vscode.WebviewViewProvider {
       profiles.map(async (p): Promise<ViewAccount> => {
         const creds = await this.store.getCreds(p.id);
         const error = p.lastUsage?.error;
+        const needsReauthorization = !hasUsableOAuthCreds(creds) || isAuthProblem(error);
         return {
           id: p.id,
           label: p.label,
           subscriptionType: p.subscriptionType,
           isActive: p.id === activeId,
           windows: p.lastUsage?.windows ?? [],
-          error,
+          error: displayUsageError(error, needsReauthorization),
           fetchedAt: p.lastUsage?.fetchedAt,
           retryAfter: p.lastUsage?.retryAfter,
-          needsReauthorization: !hasUsableOAuthCreds(creds) || isAuthProblem(error),
+          needsReauthorization,
         };
       })
     ).then((accounts) => {
@@ -158,6 +160,10 @@ export class AccountsViewProvider implements vscode.WebviewViewProvider {
 }
 
 function isAuthProblem(error: string | undefined): boolean {
+  if (requiresProfileReauthorization(error)) {
+    return true;
+  }
+
   const text = error?.toLowerCase() ?? "";
   return (
     text.includes("failed to refresh token") ||
@@ -170,6 +176,16 @@ function isAuthProblem(error: string | undefined): boolean {
     text.includes("http 401") ||
     text.includes("http 403")
   );
+}
+
+function displayUsageError(
+  error: string | undefined,
+  needsReauthorization: boolean
+): string | undefined {
+  if (needsReauthorization) {
+    return "Needs reauthorization. Use Auth to refresh this profile.";
+  }
+  return error;
 }
 
 function getNonce(): string {

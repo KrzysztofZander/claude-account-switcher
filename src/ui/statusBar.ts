@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { AccountStore } from "../accountStore";
+import { requiresProfileReauthorization } from "../oauth";
 
 /**
  * Status bar item: the active account + the 5h window usage %.
@@ -36,7 +37,7 @@ export class StatusBarController {
         lines.push(`  ${w.label}: ${w.percent}%`);
       }
       if (usage.error) {
-        lines.push(`  ⚠ ${usage.error}`);
+        lines.push(`  ⚠ ${displayUsageError(usage.error)}`);
       }
     }
     lines.push("Click to switch account.");
@@ -54,4 +55,10 @@ export class StatusBarController {
   dispose(): void {
     this.item.dispose();
   }
+}
+
+function displayUsageError(error: string): string {
+  return requiresProfileReauthorization(error)
+    ? "Needs reauthorization. Use Auth to refresh this profile."
+    : error;
 }

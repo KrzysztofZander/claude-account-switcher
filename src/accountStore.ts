@@ -109,6 +109,20 @@ export class AccountStore {
     }
   }
 
+  async clearUsageError(id: string): Promise<void> {
+    const profiles = this.profiles;
+    const p = profiles.find((x) => x.id === id);
+    if (!p?.lastUsage || (!p.lastUsage.error && !p.lastUsage.retryAfter)) {
+      return;
+    }
+
+    const next = { ...p.lastUsage };
+    delete next.error;
+    delete next.retryAfter;
+    p.lastUsage = next;
+    await this.saveProfiles(profiles);
+  }
+
   async updateIdentity(id: string, identity: ClaudeAuthIdentity): Promise<void> {
     const profiles = this.profiles;
     const p = profiles.find((x) => x.id === id);
@@ -139,11 +153,23 @@ export class AccountStore {
 
   /** Overwrites a profile's tokens (e.g. after a refresh) and updates the subscription type. */
   async updateCreds(id: string, creds: OAuthCreds): Promise<void> {
+    const previous = await this.getCreds(id);
     await this.setCreds(id, creds);
     const profiles = this.profiles;
     const p = profiles.find((x) => x.id === id);
+    let changed = false;
     if (p && creds.subscriptionType && p.subscriptionType !== creds.subscriptionType) {
       p.subscriptionType = creds.subscriptionType;
+      changed = true;
+    }
+    if (p?.lastUsage && credentialsChanged(previous, creds)) {
+      const next = { ...p.lastUsage };
+      delete next.error;
+      delete next.retryAfter;
+      p.lastUsage = next;
+      changed = true;
+    }
+    if (changed) {
       await this.saveProfiles(profiles);
     }
   }
@@ -208,4 +234,14 @@ function normalizeEmail(value: string | undefined): string | undefined {
 function normalizeIdentityValue(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
+}
+
+function credentialsChanged(previous: OAuthCreds | null, next: OAuthCreds): boolean {
+  if (!previous) {
+    return true;
+  }
+  return (
+    !sameNonEmptyToken(previous.accessToken, next.accessToken) ||
+    !sameNonEmptyToken(previous.refreshToken, next.refreshToken)
+  );
 }

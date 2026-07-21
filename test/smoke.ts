@@ -3,7 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import { parseUsage } from "../src/usage";
 import { CredentialsManager } from "../src/credentials";
-import { TokenRefresher } from "../src/oauth";
+import { requiresProfileReauthorization, TokenRefresher } from "../src/oauth";
 import { AccountStore } from "../src/accountStore";
 import { SwitchService } from "../src/switchService";
 
@@ -141,6 +141,38 @@ async function runAccountStoreTests(): Promise<void> {
     scopes: [],
   });
   check("does not match accounts by empty refresh token", matched === undefined);
+
+  await store.updateUsage(profile.id, {
+    fetchedAt: 333,
+    windows: [],
+    sessionPercent: null,
+    weeklyPercent: null,
+    error: "Failed to refresh token: HTTP 400 invalid_grant",
+    retryAfter: 444,
+  });
+  await store.clearUsageError(profile.id);
+  const clearedUsage = store.get(profile.id)?.lastUsage;
+  check("clearUsageError removes auth error", clearedUsage?.error === undefined);
+  check("clearUsageError removes retry backoff", clearedUsage?.retryAfter === undefined);
+  check("clearUsageError preserves usage timestamp", clearedUsage?.fetchedAt === 333);
+
+  await store.updateUsage(profile.id, {
+    fetchedAt: 555,
+    windows: [],
+    sessionPercent: null,
+    weeklyPercent: null,
+    error: "Failed to refresh token: HTTP 400 invalid_grant",
+    retryAfter: 666,
+  });
+  await store.updateCreds(profile.id, {
+    accessToken: "reauth-access",
+    refreshToken: "reauth-refresh",
+    expiresAt: 777,
+    scopes: ["user:profile"],
+  });
+  const reauthedUsage = store.get(profile.id)?.lastUsage;
+  check("new credentials clear auth error", reauthedUsage?.error === undefined);
+  check("new credentials clear retry backoff", reauthedUsage?.retryAfter === undefined);
 }
 
 async function runUsagePollerTests(): Promise<void> {
@@ -200,6 +232,43 @@ async function runUsagePollerTests(): Promise<void> {
     "does not import isolated credentials over incomplete stored profile",
     (await brokenStore.getCreds(brokenProfile.id))?.refreshToken === ""
   );
+
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = (async () => {
+    fetchCalls++;
+    return new Response("{}", { status: 500 });
+  }) as typeof fetch;
+  try {
+    const skippedStore = createStore();
+    const skippedProfile = await skippedStore.addFromCreds("Needs auth", {
+      accessToken: "stored-access",
+      refreshToken: "stored-refresh",
+      expiresAt: 0,
+      scopes: ["user:profile"],
+    });
+    await skippedStore.updateUsage(skippedProfile.id, {
+      fetchedAt: Date.now(),
+      windows: [],
+      sessionPercent: null,
+      weeklyPercent: null,
+      error:
+        "Failed to refresh token: HTTP 400 from token endpoint: {\"error\":\"invalid_grant\"}",
+    });
+    const skippedPoller = new UsagePoller(
+      skippedStore,
+      new TokenRefresher(),
+      new CredentialsManager(),
+      () => 240,
+      () => undefined
+    );
+    await skippedPoller.pollOne(skippedProfile.id, false);
+    check("skips automatic retry after invalid_grant", fetchCalls === 0);
+    await skippedPoller.pollOne(skippedProfile.id, true);
+    check("skips forced retry after invalid_grant", fetchCalls === 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 }
 
 async function runSwitchServiceTests(): Promise<void> {
@@ -310,6 +379,24 @@ async function runTokenRefresherTests(): Promise<void> {
       scopes: [],
     });
     check("does not request without refresh token", !missingRefresh.ok && fetchCalls === 0);
+    check("missing refresh token requires reauthorization", missingRefresh.requiresReauthorization === true);
+
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          error: "invalid_grant",
+          error_description: "Refresh token not found or invalid",
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      )) as typeof fetch;
+    const invalidGrant = await new TokenRefresher().refresh({
+      accessToken: "old-access",
+      refreshToken: "dead-refresh",
+      expiresAt: 111,
+      scopes: ["user:profile"],
+    });
+    check("invalid_grant requires reauthorization", invalidGrant.requiresReauthorization === true);
+    check("invalid_grant error stays recognizable", requiresProfileReauthorization(invalidGrant.error));
   } finally {
     globalThis.fetch = originalFetch;
   }

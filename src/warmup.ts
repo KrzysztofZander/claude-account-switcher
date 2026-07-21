@@ -64,7 +64,7 @@ export class WarmupService {
       };
     }
 
-    const locked = await withFileLock(`warmup:${id}`, 30_000, async () => {
+    const locked = await withFileLock(`refresh:${id}`, 30_000, async () => {
       const latestCreds = (await this.store.getCreds(id)) ?? creds;
       if (!hasUsableOAuthCreds(latestCreds)) {
         return {
@@ -137,7 +137,7 @@ export class WarmupService {
     if (!locked.acquired) {
       return {
         ok: false,
-        message: `Say Hi is already running for "${profile.label}" in another window.`,
+        message: `Token refresh or Say Hi is already running for "${profile.label}" in another window.`,
       };
     }
 

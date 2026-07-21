@@ -24,6 +24,7 @@ export interface RefreshResult {
   creds?: OAuthCreds;
   error?: string;
   status?: number;
+  requiresReauthorization?: boolean;
 }
 
 export class TokenRefresher {
@@ -32,6 +33,7 @@ export class TokenRefresher {
       if (!isNonEmptyString(creds.refreshToken)) {
         return {
           ok: false,
+          requiresReauthorization: true,
           error:
             "Stored profile has no refresh token. Reauthorize this account profile.",
         };
@@ -57,6 +59,16 @@ export class TokenRefresher {
 
       if (!res.ok) {
         const body = await res.text().catch(() => "");
+        const oauthError = parseOAuthError(body);
+        if (isInvalidGrant(res.status, oauthError, body)) {
+          return {
+            ok: false,
+            status: res.status,
+            requiresReauthorization: true,
+            error: formatInvalidGrantError(res.status, oauthError),
+          };
+        }
+
         const sentFields = Object.keys(payload).join(", ");
         return {
           ok: false,
@@ -109,6 +121,57 @@ function normalizeScopes(scopes: unknown): string[] {
   return normalized.length > 0 ? normalized : DEFAULT_SCOPES;
 }
 
+export function requiresProfileReauthorization(error: string | undefined): boolean {
+  const text = error?.toLowerCase() ?? "";
+  return (
+    text.includes("invalid_grant") ||
+    text.includes("refresh token not found or invalid") ||
+    text.includes("stored profile has no refresh token") ||
+    text.includes("reauthorize this account profile")
+  );
+}
+
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+function parseOAuthError(body: string): { error?: string; error_description?: string } | null {
+  try {
+    const parsed = JSON.parse(body) as {
+      error?: unknown;
+      error_description?: unknown;
+    };
+    return {
+      error: typeof parsed.error === "string" ? parsed.error : undefined,
+      error_description:
+        typeof parsed.error_description === "string" ? parsed.error_description : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isInvalidGrant(
+  status: number,
+  oauthError: { error?: string } | null,
+  body: string
+): boolean {
+  return (
+    status === 400 &&
+    (oauthError?.error === "invalid_grant" || body.toLowerCase().includes("invalid_grant"))
+  );
+}
+
+function formatInvalidGrantError(
+  status: number,
+  oauthError: { error_description?: string } | null
+): string {
+  const detail = stripTrailingPunctuation(
+    oauthError?.error_description ?? "Refresh token is invalid or expired"
+  );
+  return `HTTP ${status} invalid_grant: ${detail}. Reauthorize this account profile.`;
+}
+
+function stripTrailingPunctuation(value: string): string {
+  return value.trim().replace(/[.!?]+$/, "");
 }
