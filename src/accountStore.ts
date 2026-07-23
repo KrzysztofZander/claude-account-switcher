@@ -1,6 +1,9 @@
 import * as crypto from "crypto";
 import * as vscode from "vscode";
-import { sameNonEmptyToken } from "./credentialValidation";
+import {
+  sameNonEmptyToken,
+  shouldPreferCredentialCandidate,
+} from "./credentialValidation";
 import { AccountProfile, ClaudeAuthIdentity, OAuthCreds, UsageSnapshot } from "./types";
 
 const PROFILES_KEY = "claudeSwitcher.profiles";
@@ -198,14 +201,24 @@ export class AccountStore {
    * but it can also mean the user manually logged in to another account. Overwriting here
    * would destroy the stored profile and is a common cause of later login failures.
    */
-  async syncActiveFromFile(fileCreds: OAuthCreds | null): Promise<void> {
+  async syncActiveFromFile(
+    fileCreds: OAuthCreds | null,
+    identity?: ClaudeAuthIdentity
+  ): Promise<void> {
     if (!fileCreds) {
       return;
     }
     const matched = await this.findByTokens(fileCreds);
     if (matched) {
       await this.setActiveId(matched);
-      await this.updateCreds(matched, fileCreds);
+      await this.updateCredsIfNewer(matched, fileCreds);
+      return;
+    }
+
+    const identityMatch = identity ? this.findByIdentity(identity) : undefined;
+    if (identityMatch) {
+      await this.setActiveId(identityMatch.id);
+      await this.updateCredsIfNewer(identityMatch.id, fileCreds);
       return;
     }
     const activeId = this.getActiveId();
@@ -221,8 +234,16 @@ export class AccountStore {
       return;
     }
 
-    if (activeId) {
-      await this.setActiveId(undefined);
+    const activeProfile = activeId ? this.get(activeId) : undefined;
+    if (activeId && activeProfile && identity && profileMatchesIdentity(activeProfile, identity)) {
+      await this.updateCredsIfNewer(activeId, fileCreds);
+    }
+  }
+
+  private async updateCredsIfNewer(id: string, candidate: OAuthCreds): Promise<void> {
+    const stored = await this.getCreds(id);
+    if (!stored || shouldPreferCredentialCandidate(candidate, stored)) {
+      await this.updateCreds(id, candidate);
     }
   }
 }
@@ -234,6 +255,20 @@ function normalizeEmail(value: string | undefined): string | undefined {
 function normalizeIdentityValue(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
+}
+
+function profileMatchesIdentity(
+  profile: AccountProfile,
+  identity: ClaudeAuthIdentity
+): boolean {
+  const profileOrgId = normalizeIdentityValue(profile.authOrgId);
+  const identityOrgId = normalizeIdentityValue(identity.orgId);
+  if (profileOrgId && identityOrgId) {
+    return profileOrgId === identityOrgId;
+  }
+  const profileEmail = normalizeEmail(profile.authEmail);
+  const identityEmail = normalizeEmail(identity.email);
+  return Boolean(profileEmail && identityEmail && profileEmail === identityEmail);
 }
 
 function credentialsChanged(previous: OAuthCreds | null, next: OAuthCreds): boolean {

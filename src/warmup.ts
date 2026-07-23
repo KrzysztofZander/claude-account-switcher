@@ -12,6 +12,7 @@ import { hasUsableOAuthCreds } from "./credentialValidation";
 import { CredentialsManager } from "./credentials";
 import { getAccountConfigDir } from "./isolatedConfig";
 import { withFileLock } from "./lock";
+import { ProfileActivityRegistry } from "./profileActivity";
 
 export interface WarmupResult {
   ok: boolean;
@@ -30,7 +31,8 @@ export class WarmupService {
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly store: AccountStore,
-    private readonly credentials: CredentialsManager
+    private readonly credentials: CredentialsManager,
+    private readonly profileActivity?: ProfileActivityRegistry
   ) {}
 
   getProfileConfigDir(id: string): string {
@@ -44,7 +46,11 @@ export class WarmupService {
     }
 
     const currentFileProfileId = await this.findCurrentFileProfileId();
-    if (this.store.getActiveId() === id || currentFileProfileId === id) {
+    if (
+      this.store.getActiveId() === id ||
+      currentFileProfileId === id ||
+      this.profileActivity?.isActive(id) === true
+    ) {
       return {
         ok: false,
         message:
@@ -65,6 +71,13 @@ export class WarmupService {
     }
 
     const locked = await withFileLock(`refresh:${id}`, 30_000, async () => {
+      if (this.profileActivity?.isActive(id) === true) {
+        return {
+          ok: false,
+          message: `"${profile.label}" became active in another window. Say Hi was skipped.`,
+        };
+      }
+      this.profileActivity?.markPending(id);
       const latestCreds = (await this.store.getCreds(id)) ?? creds;
       if (!hasUsableOAuthCreds(latestCreds)) {
         return {

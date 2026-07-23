@@ -3,9 +3,13 @@ import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 import { AccountStore } from "./accountStore";
-import { hasUsableOAuthCreds } from "./credentialValidation";
+import {
+  hasUsableOAuthCreds,
+  shouldPreferCredentialCandidate,
+} from "./credentialValidation";
 import { CredentialsManager } from "./credentials";
 import { getAccountConfigDir } from "./isolatedConfig";
+import { ProfileActivityRegistry } from "./profileActivity";
 
 export interface AccountWindowResult {
   ok: boolean;
@@ -21,7 +25,8 @@ export class AccountWindowService {
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly store: AccountStore,
-    private readonly credentials: CredentialsManager
+    private readonly credentials: CredentialsManager,
+    private readonly profileActivity?: ProfileActivityRegistry
   ) {}
 
   async open(id: string): Promise<AccountWindowResult> {
@@ -38,7 +43,7 @@ export class AccountWindowService {
       };
     }
 
-    const creds = await this.store.getCreds(id);
+    let creds = await this.store.getCreds(id);
     if (!creds) {
       return { ok: false, message: `No stored credentials for "${profile.label}".` };
     }
@@ -49,10 +54,25 @@ export class AccountWindowService {
           `"${profile.label}" needs reauthorization. Use "Claude: Reauthorize account profile" for this profile first.`,
       };
     }
+    if (this.profileActivity?.isActive(id)) {
+      return {
+        ok: false,
+        message:
+          `"${profile.label}" is already active in another VS Code window. ` +
+          "Close or switch that window before opening another session for the same account.",
+      };
+    }
 
+    this.profileActivity?.markPending(id);
     const configDir = getAccountConfigDir(this.context, id);
     fs.mkdirSync(configDir, { recursive: true });
-    this.credentials.writeCreds(creds, configDir);
+    const fileCreds = this.credentials.readCurrent(configDir);
+    if (fileCreds && shouldPreferCredentialCandidate(fileCreds, creds)) {
+      creds = fileCreds;
+      await this.store.updateCreds(id, fileCreds);
+    } else {
+      this.credentials.writeCreds(creds, configDir);
+    }
 
     const workspacePath = this.getWorkspacePath(id, workspaceFolders);
     fs.mkdirSync(path.dirname(workspacePath), { recursive: true });

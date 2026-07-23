@@ -2,7 +2,11 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
-import { hasAccessToken, hasUsableOAuthCreds } from "./credentialValidation";
+import {
+  hasAccessToken,
+  hasUsableOAuthCreds,
+  sameNonEmptyToken,
+} from "./credentialValidation";
 import { CredentialsFile, OAuthCreds } from "./types";
 
 /**
@@ -88,6 +92,24 @@ export class CredentialsManager {
     } catch {
       /* best-effort on Windows */
     }
+  }
+
+  /**
+   * Replaces a rotating-token credential file only while it still contains the
+   * refresh token that was just spent. If Claude Code won the race and already
+   * wrote a newer generation, that newer file is left untouched.
+   */
+  writeCredsIfCurrent(
+    expected: OAuthCreds,
+    next: OAuthCreds,
+    configDir?: string
+  ): boolean {
+    const current = this.readCurrent(configDir);
+    if (!current || !sameNonEmptyToken(current.refreshToken, expected.refreshToken)) {
+      return false;
+    }
+    this.writeCreds(next, configDir);
+    return true;
   }
 
   private backupPath(): string {

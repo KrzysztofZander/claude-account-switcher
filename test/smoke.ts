@@ -5,6 +5,8 @@ import { parseUsage } from "../src/usage";
 import { CredentialsManager } from "../src/credentials";
 import { requiresProfileReauthorization, TokenRefresher } from "../src/oauth";
 import { AccountStore } from "../src/accountStore";
+import { buildBrowserAuthorizationUrl, parseBrowserTokenResponse } from "../src/browserOAuth";
+import { ProfileActivityRegistry } from "../src/profileActivity";
 import { SwitchService } from "../src/switchService";
 
 let failures = 0;
@@ -63,6 +65,17 @@ mgr.writeCreds(credsB as never);
 const rawAfter = JSON.parse(fs.readFileSync(credPath, "utf8"));
 check("preserves extra fields on write", rawAfter.otherField === 123 && rawAfter.claudeAiOauth.accessToken === "BBB");
 
+check(
+  "does not overwrite a credential file that Claude already rotated",
+  mgr.writeCredsIfCurrent(credsA as never, credsB as never) === false &&
+    mgr.readCurrent()?.refreshToken === "rb"
+);
+check(
+  "compare-and-swap persists a rotation from the current generation",
+  mgr.writeCredsIfCurrent(credsB as never, credsA as never) === true &&
+    mgr.readCurrent()?.refreshToken === "ra"
+);
+
 fs.writeFileSync(credPath, JSON.stringify({ claudeAiOauth: { accessToken: "", refreshToken: "", expiresAt: 0, scopes: [] } }));
 check("empty tokens are not a current login", mgr.readCurrent() === null);
 
@@ -105,6 +118,59 @@ function createStore(): AccountStore {
   } as never);
 }
 
+function runBrowserOAuthTests(): void {
+  console.log("Browser OAuth:");
+  const url = new URL(buildBrowserAuthorizationUrl(43123, "expected-state", "pkce-challenge"));
+  check(
+    "uses the Claude subscription authorization endpoint",
+    url.origin === "https://claude.com" && url.pathname === "/cai/oauth/authorize"
+  );
+  check(
+    "uses loopback callback and PKCE",
+    url.searchParams.get("redirect_uri") === "http://127.0.0.1:43123/callback" &&
+      url.searchParams.get("code_challenge") === "pkce-challenge" &&
+      url.searchParams.get("code_challenge_method") === "S256"
+  );
+  check(
+    "binds the authorization response to a random state",
+    url.searchParams.get("state") === "expected-state"
+  );
+
+  const parsed = parseBrowserTokenResponse({
+    access_token: "browser-access",
+    refresh_token: "browser-refresh",
+    expires_in: 3600,
+    refresh_token_expires_in: 7200,
+    scope: "user:profile user:inference",
+    account: { email_address: "browser@example.com" },
+    organization: { uuid: "org-browser", name: "Browser Org" },
+  });
+  check(
+    "maps a browser token response to credentials",
+    parsed.creds?.accessToken === "browser-access" &&
+      parsed.creds.refreshToken === "browser-refresh" &&
+      parsed.creds.scopes.join(" ") === "user:profile user:inference"
+  );
+  check(
+    "maps account identity without the CLI",
+    parsed.identity?.email === "browser@example.com" && parsed.identity.orgId === "org-browser"
+  );
+}
+
+function runProfileActivityTests(): void {
+  console.log("ProfileActivityRegistry:");
+  const storageDir = fs.mkdtempSync(path.join(os.tmpdir(), "cas-activity-test-"));
+  const context = { globalStorageUri: { fsPath: storageDir } } as never;
+  const owner = new ProfileActivityRegistry(context);
+  const observer = new ProfileActivityRegistry(context);
+  owner.setActiveProfile("profile-a");
+  check("shares active-profile ownership across extension hosts", observer.isActive("profile-a"));
+  owner.dispose();
+  check("removes the window lease on disposal", !observer.isActive("profile-a"));
+  observer.dispose();
+  fs.rmSync(storageDir, { recursive: true, force: true });
+}
+
 async function runAccountStoreTests(): Promise<void> {
   console.log("AccountStore:");
 
@@ -125,7 +191,22 @@ async function runAccountStoreTests(): Promise<void> {
     "does not repair incomplete profile from unmatched current file",
     (await store.getCreds(profile.id))?.refreshToken === ""
   );
-  check("clears active marker when current file does not match", store.getActiveId() === undefined);
+  check("keeps remembered active marker when an unmatched file cannot be identified", store.getActiveId() === profile.id);
+
+  await store.updateIdentity(profile.id, { email: "owner@example.com", orgId: "org-1" });
+  await store.syncActiveFromFile(
+    {
+      accessToken: "rotated-access",
+      refreshToken: "rotated-refresh",
+      expiresAt: 333,
+      scopes: ["user:profile"],
+    },
+    { email: "owner@example.com", orgId: "org-1" }
+  );
+  check(
+    "imports a fully rotated active file by verified account identity",
+    (await store.getCreds(profile.id))?.refreshToken === "rotated-refresh"
+  );
 
   const noRefreshStore = createStore();
   await noRefreshStore.addFromCreds("A", {
@@ -191,13 +272,15 @@ async function runUsagePollerTests(): Promise<void> {
     new CredentialsManager(),
     () => 240,
     () => undefined,
-    () => ({
-      accessToken: "",
-      refreshToken: "",
-      expiresAt: 0,
-      refreshTokenExpiresAt: Date.now() + 7_200_000,
-      scopes: ["user:profile"],
-    })
+    {
+      readProfileCreds: () => ({
+        accessToken: "",
+        refreshToken: "",
+        expiresAt: 0,
+        refreshTokenExpiresAt: Date.now() + 7_200_000,
+        scopes: ["user:profile"],
+      }),
+    }
   );
   await (poller as never as { syncProfileConfigCreds(id: string, stored: unknown): Promise<unknown> })
     .syncProfileConfigCreds(profile.id, await store.getCreds(profile.id));
@@ -219,18 +302,70 @@ async function runUsagePollerTests(): Promise<void> {
     new CredentialsManager(),
     () => 240,
     () => undefined,
-    () => ({
-      accessToken: "other-access",
-      refreshToken: "other-refresh",
-      expiresAt: Date.now() + 3_600_000,
-      scopes: ["user:profile"],
-    })
+    {
+      readProfileCreds: () => ({
+        accessToken: "other-access",
+        refreshToken: "other-refresh",
+        expiresAt: Date.now() + 3_600_000,
+        scopes: ["user:profile"],
+      }),
+    }
   );
   await (brokenPoller as never as { syncProfileConfigCreds(id: string, stored: unknown): Promise<unknown> })
     .syncProfileConfigCreds(brokenProfile.id, await brokenStore.getCreds(brokenProfile.id));
   check(
     "does not import isolated credentials over incomplete stored profile",
     (await brokenStore.getCreds(brokenProfile.id))?.refreshToken === ""
+  );
+
+  const restartStore = createStore();
+  const refreshExpiry = Date.now() + 30 * 24 * 3_600_000;
+  const restartProfile = await restartStore.addFromCreds("Restarted", {
+    accessToken: "before-restart-access",
+    refreshToken: "before-restart-refresh",
+    expiresAt: Date.now() - 3_600_000,
+    refreshTokenExpiresAt: refreshExpiry,
+    scopes: ["user:profile"],
+  });
+  const afterRestart = {
+    accessToken: "after-restart-access",
+    refreshToken: "after-restart-refresh",
+    expiresAt: Date.now() + 3_600_000,
+    refreshTokenExpiresAt: refreshExpiry,
+    scopes: ["user:profile"],
+  };
+  const restartPoller = new UsagePoller(
+    restartStore,
+    new TokenRefresher(),
+    new CredentialsManager(),
+    () => 240,
+    () => undefined,
+    { readProfileCreds: () => afterRestart }
+  );
+  await (restartPoller as never as { syncProfileConfigCreds(id: string, stored: unknown): Promise<unknown> })
+    .syncProfileConfigCreds(restartProfile.id, await restartStore.getCreds(restartProfile.id));
+  check(
+    "restart imports Claude's rotated tokens when refresh-token expiry is unchanged",
+    (await restartStore.getCreds(restartProfile.id))?.refreshToken === "after-restart-refresh"
+  );
+
+  const staleReplica = {
+    ...afterRestart,
+    refreshToken: "stale-refresh",
+  };
+  const stalePoller = new UsagePoller(
+    restartStore,
+    new TokenRefresher(),
+    new CredentialsManager(),
+    () => 240,
+    () => undefined,
+    { readProfileCreds: () => staleReplica }
+  );
+  await (stalePoller as never as { syncProfileConfigCreds(id: string, stored: unknown): Promise<unknown> })
+    .syncProfileConfigCreds(restartProfile.id, await restartStore.getCreds(restartProfile.id));
+  check(
+    "equal-age replica cannot restore an already spent refresh token",
+    (await restartStore.getCreds(restartProfile.id))?.refreshToken === "after-restart-refresh"
   );
 
   const originalFetch = globalThis.fetch;
@@ -240,6 +375,37 @@ async function runUsagePollerTests(): Promise<void> {
     return new Response("{}", { status: 500 });
   }) as typeof fetch;
   try {
+    const recoveredStore = createStore();
+    const recoveredProfile = await recoveredStore.addFromCreds("Recoverable", {
+      accessToken: "spent-access",
+      refreshToken: "spent-refresh",
+      expiresAt: Date.now() - 3_600_000,
+      refreshTokenExpiresAt: refreshExpiry,
+      scopes: ["user:profile"],
+    });
+    await recoveredStore.updateUsage(recoveredProfile.id, {
+      fetchedAt: Date.now(),
+      windows: [],
+      sessionPercent: null,
+      weeklyPercent: null,
+      error: "Failed to refresh token: HTTP 400 invalid_grant",
+    });
+    const recoveredPoller = new UsagePoller(
+      recoveredStore,
+      new TokenRefresher(),
+      new CredentialsManager(),
+      () => 240,
+      () => undefined,
+      { readProfileCreds: () => afterRestart }
+    );
+    await recoveredPoller.pollOne(recoveredProfile.id, false);
+    check(
+      "recovers a profile marked invalid when Claude persisted a newer generation",
+      (await recoveredStore.getCreds(recoveredProfile.id))?.refreshToken ===
+        "after-restart-refresh" && fetchCalls === 1
+    );
+    fetchCalls = 0;
+
     const skippedStore = createStore();
     const skippedProfile = await skippedStore.addFromCreds("Needs auth", {
       accessToken: "stored-access",
@@ -266,6 +432,24 @@ async function runUsagePollerTests(): Promise<void> {
     check("skips automatic retry after invalid_grant", fetchCalls === 0);
     await skippedPoller.pollOne(skippedProfile.id, true);
     check("skips forced retry after invalid_grant", fetchCalls === 0);
+
+    const activeStore = createStore();
+    const activeProfile = await activeStore.addFromCreds("Active", {
+      accessToken: "expired-access",
+      refreshToken: "must-not-be-spent",
+      expiresAt: Date.now() - 1,
+      scopes: ["user:profile"],
+    });
+    const activePoller = new UsagePoller(
+      activeStore,
+      new TokenRefresher(),
+      new CredentialsManager(),
+      () => 240,
+      () => undefined,
+      { isProfileActive: () => true }
+    );
+    await activePoller.pollOne(activeProfile.id, true);
+    check("never refreshes a token owned by an active Claude window", fetchCalls === 0);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -402,6 +586,8 @@ async function runTokenRefresherTests(): Promise<void> {
   }
 }
 
+runProfileActivityTests();
+runBrowserOAuthTests();
 runAccountStoreTests()
   .then(runUsagePollerTests)
   .then(runSwitchServiceTests)

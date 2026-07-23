@@ -1,5 +1,9 @@
 import { AccountStore } from "./accountStore";
-import { hasUsableOAuthCreds, sameNonEmptyToken } from "./credentialValidation";
+import {
+  hasUsableOAuthCreds,
+  sameNonEmptyToken,
+  shouldPreferCredentialCandidate,
+} from "./credentialValidation";
 import { CredentialsManager } from "./credentials";
 import { withFileLock } from "./lock";
 import { requiresProfileReauthorization, TokenRefresher } from "./oauth";
@@ -99,6 +103,21 @@ export interface FetchResult {
   error?: string;
 }
 
+export interface UsagePollerCoordination {
+  /** Reads the persistent per-profile Claude config, if one exists. */
+  readProfileCreds?: (id: string) => OAuthCreds | null;
+  /** Reconciles the credentials file used by this VS Code window with SecretStorage. */
+  syncCurrentProfile?: () => Promise<void>;
+  /** True while Claude Code owns this profile in any live VS Code window. */
+  isProfileActive?: (id: string) => boolean;
+  /** Propagates a successful rotation to local credential replicas using compare-and-swap. */
+  persistRefreshedCreds?: (
+    id: string,
+    previous: OAuthCreds,
+    next: OAuthCreds
+  ) => void;
+}
+
 /** A single call to the usage endpoint for the given token. */
 export async function fetchUsage(creds: OAuthCreds): Promise<FetchResult> {
   try {
@@ -140,7 +159,7 @@ export class UsagePoller {
     private readonly credentials: CredentialsManager,
     private readonly getIntervalSeconds: () => number,
     private readonly onUpdate: () => void,
-    private readonly readProfileCreds?: (id: string) => OAuthCreds | null
+    private readonly coordination: UsagePollerCoordination = {}
   ) {}
 
   start(): void {
@@ -164,7 +183,11 @@ export class UsagePoller {
 
   async pollAll(force: boolean): Promise<void> {
     // First sync the active profile from the file (fresh tokens).
-    await this.store.syncActiveFromFile(this.credentials.readCurrent());
+    if (this.coordination.syncCurrentProfile) {
+      await this.coordination.syncCurrentProfile();
+    } else {
+      await this.store.syncActiveFromFile(this.credentials.readCurrent());
+    }
 
     const profiles = this.store.list();
     for (const profile of profiles) {
@@ -180,11 +203,7 @@ export class UsagePoller {
     }
 
     // Backoff: if we recently got a 429, do not retry (unless forced).
-    const prev = profile.lastUsage;
-    if (!force && prev?.retryAfter && prev.retryAfter > Date.now()) {
-      return;
-    }
-    if (requiresProfileReauthorization(prev?.error)) {
+    if (!force && profile.lastUsage?.retryAfter && profile.lastUsage.retryAfter > Date.now()) {
       return;
     }
 
@@ -192,9 +211,31 @@ export class UsagePoller {
     if (!creds) {
       return;
     }
+    // Always reconcile the per-profile file before honoring a previous auth error.
+    // Claude may have won a refresh race and persisted the valid rotated generation.
     creds = await this.syncProfileConfigCreds(id, creds);
+    let prev = this.store.get(id)?.lastUsage;
+    if (requiresProfileReauthorization(prev?.error) && this.isProfileActive(id)) {
+      await this.syncActiveProfile();
+      creds = (await this.store.getCreds(id)) ?? creds;
+      prev = this.store.get(id)?.lastUsage;
+    }
+    if (requiresProfileReauthorization(prev?.error)) {
+      return;
+    }
 
     // Refresh an expired token (it rotates, so save the new one).
+    if (TokenRefresher.isExpired(creds)) {
+      if (this.isProfileActive(id)) {
+        await this.syncActiveProfile();
+        const synced = await this.store.getCreds(id);
+        if (!synced || TokenRefresher.isExpired(synced)) {
+          return;
+        }
+        creds = synced;
+      }
+    }
+
     if (TokenRefresher.isExpired(creds)) {
       const refreshed = await this.refreshCreds(id, creds, false, prev);
       if (!refreshed) {
@@ -205,10 +246,20 @@ export class UsagePoller {
 
     let result = await fetchUsage(creds);
     if (result.status === 401 || result.status === 403) {
-      const refreshed = await this.refreshCreds(id, creds, true, prev);
-      if (refreshed) {
-        creds = refreshed;
+      if (this.isProfileActive(id)) {
+        await this.syncActiveProfile();
+        const synced = await this.store.getCreds(id);
+        if (!synced || !credentialsChanged(creds, synced)) {
+          return;
+        }
+        creds = synced;
         result = await fetchUsage(creds);
+      } else {
+        const refreshed = await this.refreshCreds(id, creds, true, prev);
+        if (refreshed) {
+          creds = refreshed;
+          result = await fetchUsage(creds);
+        }
       }
     }
 
@@ -236,6 +287,10 @@ export class UsagePoller {
       const stored = (await this.store.getCreds(id)) ?? credsBeforeLock;
       const latest = await this.syncProfileConfigCreds(id, stored);
 
+      if (this.isProfileActive(id)) {
+        return { ok: false as const, deferred: true as const };
+      }
+
       if (!force && !TokenRefresher.isExpired(latest)) {
         return { ok: true as const, creds: latest };
       }
@@ -246,6 +301,10 @@ export class UsagePoller {
 
       const refreshed = await this.refresher.refresh(latest);
       if (!refreshed.ok || !refreshed.creds) {
+        const recovered = await this.syncProfileConfigCreds(id, latest);
+        if (credentialsChanged(latest, recovered)) {
+          return { ok: true as const, creds: recovered };
+        }
         return {
           ok: false as const,
           error: "Failed to refresh token: " + (refreshed.error ?? "error"),
@@ -253,12 +312,10 @@ export class UsagePoller {
       }
 
       await this.store.updateCreds(id, refreshed.creds);
-      if (this.store.getActiveId() === id) {
-        try {
-          this.credentials.writeCreds(refreshed.creds);
-        } catch {
-          /* best effort: Claude Code can still use the stored profile on next switch */
-        }
+      try {
+        this.coordination.persistRefreshedCreds?.(id, latest, refreshed.creds);
+      } catch {
+        /* SecretStorage remains authoritative and stale replicas cannot replace it. */
       }
       return { ok: true as const, creds: refreshed.creds };
     });
@@ -275,6 +332,9 @@ export class UsagePoller {
     }
 
     if (!locked.value?.ok) {
+      if (locked.value?.deferred) {
+        return null;
+      }
       await this.store.updateUsage(id, {
         fetchedAt: Date.now(),
         windows: prev?.windows ?? [],
@@ -292,7 +352,7 @@ export class UsagePoller {
     id: string,
     stored: OAuthCreds
   ): Promise<OAuthCreds> {
-    const fileCreds = this.readProfileCreds?.(id);
+    const fileCreds = this.coordination.readProfileCreds?.(id);
     if (!fileCreds) {
       return stored;
     }
@@ -304,28 +364,27 @@ export class UsagePoller {
     await this.store.updateCreds(id, fileCreds);
     return fileCreds;
   }
+
+  private isProfileActive(id: string): boolean {
+    return this.store.getActiveId() === id || this.coordination.isProfileActive?.(id) === true;
+  }
+
+  private async syncActiveProfile(): Promise<void> {
+    if (this.coordination.syncCurrentProfile) {
+      await this.coordination.syncCurrentProfile();
+    }
+  }
 }
 
 function shouldPreferProfileFileCreds(fileCreds: OAuthCreds, stored: OAuthCreds): boolean {
-  if (!hasUsableOAuthCreds(fileCreds)) {
-    return false;
-  }
-  if (!hasUsableOAuthCreds(stored)) {
-    return false;
-  }
-
-  if (
-    sameNonEmptyToken(fileCreds.accessToken, stored.accessToken) ||
-    sameNonEmptyToken(fileCreds.refreshToken, stored.refreshToken)
-  ) {
-    return true;
-  }
-
-  const fileFreshness = Math.max(timestamp(fileCreds.expiresAt), timestamp(fileCreds.refreshTokenExpiresAt));
-  const storedFreshness = Math.max(timestamp(stored.expiresAt), timestamp(stored.refreshTokenExpiresAt));
-  return fileFreshness > storedFreshness;
+  return (
+    hasUsableOAuthCreds(stored) && shouldPreferCredentialCandidate(fileCreds, stored)
+  );
 }
 
-function timestamp(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+function credentialsChanged(previous: OAuthCreds, next: OAuthCreds): boolean {
+  return (
+    !sameNonEmptyToken(previous.accessToken, next.accessToken) ||
+    !sameNonEmptyToken(previous.refreshToken, next.refreshToken)
+  );
 }

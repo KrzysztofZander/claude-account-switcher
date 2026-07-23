@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.5
+
+- Added browser-based OAuth authorization that works without Claude Code CLI.
+- Automatically offer browser authorization when the CLI cannot be found.
+- Added a dedicated command for browser authorization even when the CLI is available.
+
+## 0.2.4
+
+- Improved authorization reliability for saved accounts by consistently preserving and selecting
+  the newest valid access and refresh token generation.
+- Added cross-window active-profile leases so background usage polling never spends a rotating
+  refresh token currently owned by Claude Code in another VS Code window.
+- Propagate successful inactive-profile token rotations to matching credential files with an
+  atomic compare-and-swap, preventing stale files from restoring already spent refresh tokens.
+- Recover profiles previously marked `invalid_grant` when Claude Code has already persisted a
+  newer valid token generation for the same saved profile.
+- Reconcile fully rotated active credentials using the verified Claude account identity.
+
 ## 0.2.3
 
 - Treat OAuth `invalid_grant` / invalid refresh-token responses as a reauthorization-needed

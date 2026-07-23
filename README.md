@@ -20,16 +20,21 @@ and re-login.
   `--model haiku` by default, without switching the active `.credentials.json`.
 - **Independent account windows** — open the same project in separate VS Code windows, each
   with its own Claude account and `CLAUDE_CONFIG_DIR`.
-- **Login helper** — opens an integrated terminal with `claude auth login`.
+- **Browser authorization** — if Claude Code CLI is unavailable, complete OAuth login in the
+  default browser; a dedicated command is available even when the CLI is installed.
+- **Login helper** — prefers an integrated terminal with `claude auth login` when the CLI is
+  available, then falls back to browser authorization.
 - **Isolated reauthorization** — if a saved profile's credentials break, re-login happens in
   that profile's own `CLAUDE_CONFIG_DIR` instead of copying the currently active account.
 - **Status bar** — the active account and its usage % always in view.
 
 ## Requirements
 
-- **Claude Code CLI is required** for this extension to work correctly.
-- The `claude` command must be available in VS Code's PATH, or `claudeSwitcher.claudeCommand`
-  must point to the full path of `claude`, `claude.exe`, or `claude.cmd`.
+- Claude Code CLI is optional for browser authorization, account switching, and usage checks.
+  It is still required for **Say Hi**, CLI-based identity checks, and using Claude Code itself.
+- For CLI-only features, the `claude` command must be available in VS Code's PATH, or
+  `claudeSwitcher.claudeCommand` must point to the full path of `claude`, `claude.exe`, or
+  `claude.cmd`.
 - On Windows PowerShell, Claude Code CLI can be installed with:
 
 ```powershell
@@ -50,8 +55,10 @@ irm https://claude.ai/install.ps1 | iex
 - Usage is read from the unofficial `api.anthropic.com/api/oauth/usage` endpoint (the same
   source as `/usage`). It is **heavily rate-limited**, so refreshing is capped to a safe interval
   (240s by default, minimum 180s) plus a manual ⟳ refresh.
-- Token refreshes are guarded with a cross-window lock. This reduces intermittent login failures
-  caused by two VS Code windows trying to spend the same rotating refresh token at once.
+- Active profiles are advertised through short-lived cross-window leases. Background usage
+  polling never spends a rotating refresh token owned by a live Claude Code window, while
+  inactive-account refreshes remain guarded by a cross-window lock and are copied back to every
+  matching local credential file.
 
 ## Usage
 
@@ -71,7 +78,8 @@ irm https://claude.ai/install.ps1 | iex
 | `Claude: Refresh usage limits` | forces a refresh |
 | `Claude: Say Hi on account` | warms up inactive saved accounts via `claude -p` |
 | `Claude: Open independent account window` | opens this project in a new VS Code window scoped to one account |
-| `Claude: Log in from terminal` | opens `claude auth login` in an integrated terminal |
+| `Claude: Log in from terminal` | opens `claude auth login`, or falls back to browser authorization when CLI is unavailable |
+| `Claude: Authorize in browser (without CLI)` | completes OAuth authorization in the default browser |
 | `Claude: Reauthorize account profile` | opens isolated login for a saved profile without touching the active account |
 | `Claude: Complete profile reauthorization` | imports the completed isolated login into that same profile |
 | `Claude: Undo last switch` | restores the previous account from `.bak` |
@@ -85,7 +93,7 @@ irm https://claude.ai/install.ps1 | iex
 | `claudeSwitcher.autoReloadAfterSwitch` | `false` | auto-reload the window after switching |
 | `claudeSwitcher.credentialsPath` | `""` | override the path to `.credentials.json` |
 | `claudeSwitcher.warnThresholdPercent` | `80` | warning threshold (% → red bar) |
-| `claudeSwitcher.claudeCommand` | `claude` | CLI command used for login and Say Hi; set the full path if VS Code cannot find it |
+| `claudeSwitcher.claudeCommand` | `claude` | CLI command used for CLI login and Say Hi; set the full path if VS Code cannot find it |
 | `claudeSwitcher.sayHiModel` | `haiku` | model alias passed to `claude -p` |
 | `claudeSwitcher.sayHiPrompt` | `Hi` | prompt used by Say Hi |
 | `claudeSwitcher.sayHiTimeoutSeconds` | `120` | Say Hi timeout |
@@ -128,9 +136,9 @@ account. Independent windows avoid that by setting both:
 }
 ```
 
-Open one generated window per account you want to run. Avoid running two active Claude Code
-sessions on the same account at the same time, because the upstream refresh token still belongs to
-that account and can rotate.
+Open one generated window per account you want to run. The extension refuses to open a second
+active window for the same saved profile, because the upstream refresh token belongs to that
+account and can rotate.
 
 ## Security and disclaimers
 

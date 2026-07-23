@@ -8,16 +8,21 @@ import { OAuthCreds } from "./types";
  * token is single-use (it rotates) — the caller MUST persist the returned new refresh
  * token back to the profile.
  */
-const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
-const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+export const OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
+export const OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+export const CLAUDE_AI_AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize";
 const OAUTH_BETA = "oauth-2025-04-20";
-const DEFAULT_SCOPES = [
+export const CLAUDE_CODE_SCOPES = [
+  "org:create_api_key",
   "user:profile",
   "user:inference",
   "user:sessions:claude_code",
   "user:mcp_servers",
   "user:file_upload",
 ];
+const DEFAULT_REFRESH_SCOPES = CLAUDE_CODE_SCOPES.filter(
+  (scope) => scope !== "org:create_api_key"
+);
 
 export interface RefreshResult {
   ok: boolean;
@@ -42,11 +47,11 @@ export class TokenRefresher {
       const payload: Record<string, string> = {
         grant_type: "refresh_token",
         refresh_token: creds.refreshToken,
-        client_id: creds.clientId ?? CLIENT_ID,
+        client_id: creds.clientId ?? OAUTH_CLIENT_ID,
         scope: normalizeScopes(creds.scopes).join(" "),
       };
 
-      const res = await fetch(TOKEN_URL, {
+      const res = await fetch(OAUTH_TOKEN_URL, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -115,10 +120,10 @@ export class TokenRefresher {
 
 function normalizeScopes(scopes: unknown): string[] {
   if (!Array.isArray(scopes)) {
-    return DEFAULT_SCOPES;
+    return DEFAULT_REFRESH_SCOPES;
   }
   const normalized = scopes.filter(isNonEmptyString);
-  return normalized.length > 0 ? normalized : DEFAULT_SCOPES;
+  return normalized.length > 0 ? normalized : DEFAULT_REFRESH_SCOPES;
 }
 
 export function requiresProfileReauthorization(error: string | undefined): boolean {
