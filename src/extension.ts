@@ -287,6 +287,7 @@ export function activate(context: vscode.ExtensionContext): void {
     refreshUI,
     {
       readProfileCreds: (id) => credentials.readCurrent(getAccountConfigDir(context, id)),
+      readActiveFileCreds: () => credentials.readCurrent(),
       syncCurrentProfile: synchronizeCurrentProfile,
       isProfileActive: (id) => profileActivity.isActive(id),
       persistRefreshedCreds: (id, previous, next) => {
@@ -314,6 +315,10 @@ export function activate(context: vscode.ExtensionContext): void {
       const res = await switchService.captureCurrent();
       vscode.window[res.ok ? "showInformationMessage" : "showWarningMessage"](res.message);
       if (res.ok) {
+        // Record who this profile is now. Without an identity the profile can
+        // only ever be recognized by its tokens, and Claude Code rotates both of
+        // them — after which nothing can tie the credentials file back to it.
+        await backfillKnownIdentities().catch(() => undefined);
         const activeId = store.getActiveId();
         profileActivity.setActiveProfile(activeId);
         if (activeId) {
@@ -540,6 +545,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   void synchronizeCurrentProfile()
     .catch(() => undefined)
+    .then(() => backfillKnownIdentities().catch(() => undefined))
     .then(() => {
       refreshUI();
       poller.start();

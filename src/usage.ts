@@ -12,6 +12,9 @@ import { OAuthCreds, UsageSnapshot, UsageWindow } from "./types";
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 const USER_AGENT = "claude-code/2.0.14";
 const BACKOFF_429_MS = 300_000; // 5 min after hitting the request rate limit
+const STALE_ACTIVE_PROFILE_ERROR =
+  "Saved tokens for this profile are out of date and Claude Code's current login " +
+  "could not be read. Save the current account again, or reauthorize this profile.";
 
 interface RawWindow {
   utilization?: number;
@@ -110,6 +113,12 @@ export interface UsagePollerCoordination {
   syncCurrentProfile?: () => Promise<void>;
   /** True while Claude Code owns this profile in any live VS Code window. */
   isProfileActive?: (id: string) => boolean;
+  /**
+   * Reads the credentials file Claude Code is using right now. For the active
+   * profile this is that account's current login, so it is the only generation
+   * guaranteed not to have been rotated out from under the stored copy.
+   */
+  readActiveFileCreds?: () => OAuthCreds | null;
   /** Propagates a successful rotation to local credential replicas using compare-and-swap. */
   persistRefreshedCreds?: (
     id: string,
@@ -182,16 +191,30 @@ export class UsagePoller {
   }
 
   async pollAll(force: boolean): Promise<void> {
-    // First sync the active profile from the file (fresh tokens).
-    if (this.coordination.syncCurrentProfile) {
-      await this.coordination.syncCurrentProfile();
-    } else {
-      await this.store.syncActiveFromFile(this.credentials.readCurrent());
+    // First sync the active profile from the file (fresh tokens). A sync that
+    // throws must not abort the poll: the accounts it did not reach would stop
+    // updating with no error against any of them.
+    try {
+      if (this.coordination.syncCurrentProfile) {
+        await this.coordination.syncCurrentProfile();
+      } else {
+        await this.store.syncActiveFromFile(this.credentials.readCurrent());
+      }
+    } catch {
+      /* Each profile still polls below and records its own failure. */
     }
 
     const profiles = this.store.list();
     for (const profile of profiles) {
-      await this.pollOne(profile.id, force);
+      try {
+        await this.pollOne(profile.id, force);
+      } catch (e) {
+        await this.recordFailure(
+          profile.id,
+          this.store.get(profile.id)?.lastUsage,
+          "Usage poll failed: " + (e as Error).message
+        );
+      }
     }
     this.onUpdate();
   }
@@ -209,6 +232,11 @@ export class UsagePoller {
 
     let creds = await this.store.getCreds(id);
     if (!creds) {
+      await this.recordFailure(
+        id,
+        profile.lastUsage,
+        "No stored credentials for this profile. Reauthorize this account profile."
+      );
       return;
     }
     // Always reconcile the per-profile file before honoring a previous auth error.
@@ -221,19 +249,21 @@ export class UsagePoller {
       prev = this.store.get(id)?.lastUsage;
     }
     if (requiresProfileReauthorization(prev?.error)) {
+      // Already reported as "needs reauthorization"; retrying would only spend a
+      // refresh token that the server has already rejected.
       return;
     }
 
     // Refresh an expired token (it rotates, so save the new one).
-    if (TokenRefresher.isExpired(creds)) {
-      if (this.isProfileActive(id)) {
-        await this.syncActiveProfile();
-        const synced = await this.store.getCreds(id);
-        if (!synced || TokenRefresher.isExpired(synced)) {
-          return;
-        }
-        creds = synced;
+    if (TokenRefresher.isExpired(creds) && this.isProfileActive(id)) {
+      await this.syncActiveProfile();
+      const synced = await this.store.getCreds(id);
+      const usable = this.firstUsable([synced, this.activeFileCreds()]);
+      if (!usable) {
+        await this.recordFailure(id, prev, STALE_ACTIVE_PROFILE_ERROR);
+        return;
       }
+      creds = usable;
     }
 
     if (TokenRefresher.isExpired(creds)) {
@@ -249,10 +279,12 @@ export class UsagePoller {
       if (this.isProfileActive(id)) {
         await this.syncActiveProfile();
         const synced = await this.store.getCreds(id);
-        if (!synced || !credentialsChanged(creds, synced)) {
+        const retry = this.firstUsable([synced, this.activeFileCreds()], creds);
+        if (!retry) {
+          await this.recordFailure(id, prev, STALE_ACTIVE_PROFILE_ERROR);
           return;
         }
-        creds = synced;
+        creds = retry;
         result = await fetchUsage(creds);
       } else {
         const refreshed = await this.refreshCreds(id, creds, true, prev);
@@ -266,14 +298,71 @@ export class UsagePoller {
     if (result.snapshot) {
       await this.store.updateUsage(id, result.snapshot);
     } else {
-      await this.store.updateUsage(id, {
-        fetchedAt: Date.now(),
-        windows: prev?.windows ?? [],
-        sessionPercent: prev?.sessionPercent ?? null,
-        weeklyPercent: prev?.weeklyPercent ?? null,
-        error: result.error ?? "Failed to fetch usage",
-        retryAfter: result.retryAfter,
-      });
+      await this.recordFailure(
+        id,
+        prev,
+        result.error ?? "Failed to fetch usage",
+        result.retryAfter
+      );
+    }
+  }
+
+  /**
+   * Writes a failed poll to the profile so the panel can explain itself. Every
+   * unsuccessful path must land here: a poll that returns without touching
+   * `lastUsage` leaves the last good snapshot on screen forever, with nothing
+   * anywhere to say that the numbers stopped moving.
+   */
+  private async recordFailure(
+    id: string,
+    prev: UsageSnapshot | undefined,
+    error: string,
+    retryAfter?: number
+  ): Promise<void> {
+    await this.store.updateUsage(id, {
+      fetchedAt: Date.now(),
+      windows: prev?.windows ?? [],
+      sessionPercent: prev?.sessionPercent ?? null,
+      weeklyPercent: prev?.weeklyPercent ?? null,
+      error,
+      retryAfter,
+    });
+  }
+
+  /**
+   * Picks the first credential generation that can still be used for a read,
+   * skipping any that is incomplete, expired, or identical to one the server
+   * has already rejected in this poll.
+   */
+  private firstUsable(
+    candidates: (OAuthCreds | null | undefined)[],
+    rejected?: OAuthCreds
+  ): OAuthCreds | null {
+    for (const candidate of candidates) {
+      if (!candidate || !hasUsableOAuthCreds(candidate)) {
+        continue;
+      }
+      if (TokenRefresher.isExpired(candidate)) {
+        continue;
+      }
+      if (rejected && !credentialsChanged(rejected, candidate)) {
+        continue;
+      }
+      return candidate;
+    }
+    return null;
+  }
+
+  /**
+   * The live Claude Code login. For an active profile this is that account's
+   * current generation, and reading it spends nothing — unlike a token refresh,
+   * which would race Claude Code for a single-use refresh token.
+   */
+  private activeFileCreds(): OAuthCreds | null {
+    try {
+      return this.coordination.readActiveFileCreds?.() ?? null;
+    } catch {
+      return null;
     }
   }
 
@@ -321,27 +410,22 @@ export class UsagePoller {
     });
 
     if (!locked.acquired) {
-      await this.store.updateUsage(id, {
-        fetchedAt: Date.now(),
-        windows: prev?.windows ?? [],
-        sessionPercent: prev?.sessionPercent ?? null,
-        weeklyPercent: prev?.weeklyPercent ?? null,
-        error: "Skipped token refresh because another VS Code window is refreshing it.",
-      });
+      await this.recordFailure(
+        id,
+        prev,
+        "Skipped token refresh because another VS Code window is refreshing it."
+      );
       return null;
     }
 
     if (!locked.value?.ok) {
-      if (locked.value?.deferred) {
-        return null;
-      }
-      await this.store.updateUsage(id, {
-        fetchedAt: Date.now(),
-        windows: prev?.windows ?? [],
-        sessionPercent: prev?.sessionPercent ?? null,
-        weeklyPercent: prev?.weeklyPercent ?? null,
-        error: locked.value?.error ?? "Failed to refresh token.",
-      });
+      await this.recordFailure(
+        id,
+        prev,
+        locked.value?.deferred
+          ? "Skipped token refresh because Claude Code owns this profile right now."
+          : locked.value?.error ?? "Failed to refresh token."
+      );
       return null;
     }
 

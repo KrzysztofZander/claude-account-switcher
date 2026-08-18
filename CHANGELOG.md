@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Fixed usage limits freezing on the last good snapshot for the active account. Once Claude Code
+  refreshed and rotated both tokens, the saved profile no longer matched the credentials file and
+  the poller stopped without fetching or reporting anything, so neither the automatic poll nor the
+  manual refresh button could recover it.
+- Poll the active profile against Claude Code's live login when the saved tokens have gone stale.
+  This is a read only, so it still never spends the single-use refresh token Claude Code owns.
+- Every unsuccessful usage poll now records why it failed instead of returning silently, so the
+  panel can no longer show numbers that quietly stopped moving.
+- One failing account (or a failing credentials sync) no longer aborts the poll for the others.
+- Record the Claude account identity when a profile is saved, so a fully rotated credentials file
+  can still be matched back to its profile.
+
 ## 0.2.5
 
 - Added browser-based OAuth authorization that works without Claude Code CLI.

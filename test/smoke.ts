@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { parseUsage } from "../src/usage";
+import { parseUsage, UsagePoller } from "../src/usage";
 import { CredentialsManager } from "../src/credentials";
 import { requiresProfileReauthorization, TokenRefresher } from "../src/oauth";
 import { AccountStore } from "../src/accountStore";
@@ -258,7 +258,6 @@ async function runAccountStoreTests(): Promise<void> {
 
 async function runUsagePollerTests(): Promise<void> {
   console.log("UsagePoller:");
-  const { UsagePoller } = await import("../src/usage");
   const store = createStore();
   const profile = await store.addFromCreds("Good", {
     accessToken: "stored-access",
@@ -450,8 +449,134 @@ async function runUsagePollerTests(): Promise<void> {
     );
     await activePoller.pollOne(activeProfile.id, true);
     check("never refreshes a token owned by an active Claude window", fetchCalls === 0);
+    check(
+      "an active profile it cannot poll reports why instead of freezing",
+      Boolean(activeStore.get(activeProfile.id)?.lastUsage?.error)
+    );
   } finally {
     globalThis.fetch = originalFetch;
+  }
+
+  await runStaleActiveProfileTests();
+}
+
+/**
+ * Claude Code rotates both tokens when it refreshes, so the generation saved for
+ * the active profile stops matching the credentials file and can no longer be
+ * synced back. The poller must still report usage — from the live file, which is
+ * that account's current login — and must never try to refresh it.
+ */
+async function runStaleActiveProfileTests(): Promise<void> {
+  console.log("UsagePoller (active profile with stale stored tokens):");
+  const hour = 3_600_000;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cas-stale-active-"));
+  const credPath = path.join(tmpDir, ".credentials.json");
+  process.env.TEST_CRED_PATH = credPath;
+
+  const originalFetch = globalThis.fetch;
+  let usageCalls = 0;
+  let refreshCalls = 0;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input).includes("/oauth/usage")) {
+      usageCalls++;
+      const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
+      return auth === "Bearer live-access"
+        ? new Response(
+            JSON.stringify({
+              limits: [
+                { kind: "session", group: "session", percent: 63, severity: "normal", resets_at: null },
+              ],
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          )
+        : new Response("{}", { status: 401 });
+    }
+    refreshCalls++;
+    return new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400 });
+  }) as typeof fetch;
+
+  try {
+    const store = createStore();
+    const credentials = new CredentialsManager();
+    const profile = await store.addFromCreds("Personal", {
+      accessToken: "stale-access",
+      refreshToken: "stale-refresh",
+      expiresAt: Date.now() - 9 * hour,
+      refreshTokenExpiresAt: Date.now() + 30 * 24 * hour,
+      scopes: ["user:profile"],
+    });
+    const staleFetchedAt = Date.now() - 17 * hour;
+    await store.updateUsage(profile.id, {
+      fetchedAt: staleFetchedAt,
+      windows: [
+        { kind: "session", label: "Session (5h)", percent: 45, severity: "normal", resetsAt: null },
+      ],
+      sessionPercent: 45,
+      weeklyPercent: 5,
+    });
+    // Claude Code refreshed since then, rotating both tokens in the live file.
+    credentials.writeCreds({
+      accessToken: "live-access",
+      refreshToken: "live-refresh",
+      expiresAt: Date.now() + 7 * hour,
+      refreshTokenExpiresAt: Date.now() + 30 * 24 * hour,
+      scopes: ["user:profile"],
+    });
+
+    const poller = new UsagePoller(
+      store,
+      new TokenRefresher(),
+      credentials,
+      () => 240,
+      () => undefined,
+      {
+        // The identity lookup is unavailable, so the sync cannot re-adopt the file.
+        syncCurrentProfile: async () => {
+          await store.syncActiveFromFile(credentials.readCurrent());
+        },
+        isProfileActive: () => true,
+        readActiveFileCreds: () => credentials.readCurrent(),
+      }
+    );
+
+    await poller.pollOne(profile.id, true);
+    const usage = store.get(profile.id)?.lastUsage;
+    check("reads usage from Claude Code's live login", usage?.sessionPercent === 63);
+    check("does not spend the refresh token Claude Code owns", refreshCalls === 0);
+    check("moves the snapshot off the stale one", usage?.fetchedAt !== staleFetchedAt);
+    check("reports no error once the live login worked", usage?.error === undefined);
+    check("only one usage request was needed", usageCalls === 1);
+
+    // With no readable live login there is nothing to poll with, but the profile
+    // must still say so rather than sit on numbers that stopped moving.
+    const blindStore = createStore();
+    const blindProfile = await blindStore.addFromCreds("No file", {
+      accessToken: "stale-access",
+      refreshToken: "stale-refresh",
+      expiresAt: Date.now() - 9 * hour,
+      scopes: ["user:profile"],
+    });
+    await blindStore.updateUsage(blindProfile.id, {
+      fetchedAt: staleFetchedAt,
+      windows: [],
+      sessionPercent: 45,
+      weeklyPercent: 5,
+    });
+    const blindPoller = new UsagePoller(
+      blindStore,
+      new TokenRefresher(),
+      credentials,
+      () => 240,
+      () => undefined,
+      { isProfileActive: () => true, readActiveFileCreds: () => null }
+    );
+    await blindPoller.pollOne(blindProfile.id, true);
+    const blindUsage = blindStore.get(blindProfile.id)?.lastUsage;
+    check("an unpollable active profile records an error", Boolean(blindUsage?.error));
+    check("keeps the last known percentages alongside the error", blindUsage?.sessionPercent === 45);
+  } finally {
+    globalThis.fetch = originalFetch;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }
 
