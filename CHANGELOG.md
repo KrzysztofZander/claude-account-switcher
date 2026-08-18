@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased
+
+- Fixed usage limits freezing on the last good snapshot for the active account. Once Claude Code
+  refreshed and rotated both tokens, the saved profile no longer matched the credentials file and
+  the poller stopped without fetching or reporting anything, so neither the automatic poll nor the
+  manual refresh button could recover it.
+- Poll the active profile against Claude Code's live login when the saved tokens have gone stale.
+  This is a read only, so it still never spends the single-use refresh token Claude Code owns.
+- Every unsuccessful usage poll now records why it failed instead of returning silently, so the
+  panel can no longer show numbers that quietly stopped moving.
+- One failing account (or a failing credentials sync) no longer aborts the poll for the others.
+- Record the Claude account identity when a profile is saved, so a fully rotated credentials file
+  can still be matched back to its profile.
+
+### Security
+
+- Fixed argument quoting for the Windows `.cmd`/`.bat` launcher path. Arguments were escaped only
+  for the command's own argv parser, which `cmd.exe` does not honour, so a quote in a setting could
+  end the quoted region and let a following `&` run as a separate command. Arguments are now escaped
+  for both parsers, and one that cmd.exe cannot quote at all is refused instead of run.
+- `claudeCommand`, `sayHiModel`, `sayHiPrompt` and `sayHiTimeoutSeconds` are now machine-scoped, so
+  an opened workspace can no longer choose which executable the extension runs or what is passed
+  to it.
+- A workspace-scoped `credentialsPath` is now honoured only when it points inside the extension's
+  own per-account storage. That path is read from and written to on a switch, so an arbitrary
+  workspace value could otherwise choose where your OAuth tokens are written.
+- Declared `capabilities.untrustedWorkspaces` explicitly, so the reason the extension stays disabled
+  in Restricted Mode is visible rather than implied.
+- Reduced long-lived plaintext credential copies: the switch backup is discarded once its undo has
+  been used, files set aside by a repair login are pruned to the newest two, and the copy written
+  for a Say Hi warmup is removed once the run finishes and any rotation is back in SecretStorage.
+  Backups are explicitly `0600` and isolated config directories are created `0700`.
+- The webview CSP nonce now comes from a cryptographic source instead of `Math.random`.
+
 ## 0.2.5
 
 - Added browser-based OAuth authorization that works without Claude Code CLI.

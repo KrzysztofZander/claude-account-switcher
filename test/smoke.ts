@@ -1,7 +1,9 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { parseUsage } from "../src/usage";
+import * as vscode from "vscode";
+import { buildSpawnArgs } from "../src/cli";
+import { parseUsage, UsagePoller } from "../src/usage";
 import { CredentialsManager } from "../src/credentials";
 import { requiresProfileReauthorization, TokenRefresher } from "../src/oauth";
 import { AccountStore } from "../src/accountStore";
@@ -258,7 +260,6 @@ async function runAccountStoreTests(): Promise<void> {
 
 async function runUsagePollerTests(): Promise<void> {
   console.log("UsagePoller:");
-  const { UsagePoller } = await import("../src/usage");
   const store = createStore();
   const profile = await store.addFromCreds("Good", {
     accessToken: "stored-access",
@@ -450,8 +451,165 @@ async function runUsagePollerTests(): Promise<void> {
     );
     await activePoller.pollOne(activeProfile.id, true);
     check("never refreshes a token owned by an active Claude window", fetchCalls === 0);
+    check(
+      "an active profile it cannot poll reports why instead of freezing",
+      Boolean(activeStore.get(activeProfile.id)?.lastUsage?.error)
+    );
   } finally {
     globalThis.fetch = originalFetch;
+  }
+
+  await runStaleActiveProfileTests();
+}
+
+async function runStaleActiveProfileTests(): Promise<void> {
+  console.log("UsagePoller (active profile with stale stored tokens):");
+  const hour = 3_600_000;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cas-stale-active-"));
+  const credPath = path.join(tmpDir, ".credentials.json");
+  process.env.TEST_CRED_PATH = credPath;
+
+  const originalFetch = globalThis.fetch;
+  let usageCalls = 0;
+  let refreshCalls = 0;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input).includes("/oauth/usage")) {
+      usageCalls++;
+      const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
+      return auth === "Bearer live-access"
+        ? new Response(
+            JSON.stringify({
+              limits: [
+                { kind: "session", group: "session", percent: 63, severity: "normal", resets_at: null },
+              ],
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          )
+        : new Response("{}", { status: 401 });
+    }
+    refreshCalls++;
+    return new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400 });
+  }) as typeof fetch;
+
+  try {
+    const store = createStore();
+    const credentials = new CredentialsManager();
+    const profile = await store.addFromCreds("Personal", {
+      accessToken: "stale-access",
+      refreshToken: "stale-refresh",
+      expiresAt: Date.now() - 9 * hour,
+      refreshTokenExpiresAt: Date.now() + 30 * 24 * hour,
+      scopes: ["user:profile"],
+    });
+    const staleFetchedAt = Date.now() - 17 * hour;
+    await store.updateUsage(profile.id, {
+      fetchedAt: staleFetchedAt,
+      windows: [
+        { kind: "session", label: "Session (5h)", percent: 45, severity: "normal", resetsAt: null },
+      ],
+      sessionPercent: 45,
+      weeklyPercent: 5,
+    });
+    credentials.writeCreds({
+      accessToken: "live-access",
+      refreshToken: "live-refresh",
+      expiresAt: Date.now() + 7 * hour,
+      refreshTokenExpiresAt: Date.now() + 30 * 24 * hour,
+      scopes: ["user:profile"],
+    });
+
+    const poller = new UsagePoller(
+      store,
+      new TokenRefresher(),
+      credentials,
+      () => 240,
+      () => undefined,
+      {
+        // No identity available, so the sync cannot re-adopt the file.
+        syncCurrentProfile: async () => {
+          await store.syncActiveFromFile(credentials.readCurrent());
+        },
+        isProfileActive: () => true,
+        readActiveFileCreds: () => credentials.readCurrent(),
+      }
+    );
+
+    await poller.pollOne(profile.id, true);
+    const usage = store.get(profile.id)?.lastUsage;
+    check("reads usage from Claude Code's live login", usage?.sessionPercent === 63);
+    check("does not spend the refresh token Claude Code owns", refreshCalls === 0);
+    check("moves the snapshot off the stale one", usage?.fetchedAt !== staleFetchedAt);
+    check("reports no error once the live login worked", usage?.error === undefined);
+    check("only one usage request was needed", usageCalls === 1);
+
+    const blindStore = createStore();
+    const blindProfile = await blindStore.addFromCreds("No file", {
+      accessToken: "stale-access",
+      refreshToken: "stale-refresh",
+      expiresAt: Date.now() - 9 * hour,
+      scopes: ["user:profile"],
+    });
+    await blindStore.updateUsage(blindProfile.id, {
+      fetchedAt: staleFetchedAt,
+      windows: [],
+      sessionPercent: 45,
+      weeklyPercent: 5,
+    });
+    const blindPoller = new UsagePoller(
+      blindStore,
+      new TokenRefresher(),
+      credentials,
+      () => 240,
+      () => undefined,
+      { isProfileActive: () => true, readActiveFileCreds: () => null }
+    );
+    await blindPoller.pollOne(blindProfile.id, true);
+    const blindUsage = blindStore.get(blindProfile.id)?.lastUsage;
+    check("an unpollable active profile records an error", Boolean(blindUsage?.error));
+    check("keeps the last known percentages alongside the error", blindUsage?.sessionPercent === 45);
+
+    // A profile can be active in another window, whose credentials file is not
+    // this window's. Reading ours would report the wrong account's usage.
+    const otherStore = createStore();
+    const otherProfile = await otherStore.addFromCreds("Open elsewhere", {
+      accessToken: "stale-access",
+      refreshToken: "stale-refresh",
+      expiresAt: Date.now() - 9 * hour,
+      scopes: ["user:profile"],
+    });
+    // This window is on a different profile; "Open elsewhere" is active only
+    // through another window's lease.
+    const thisWindowProfile = await otherStore.addFromCreds("This window", {
+      accessToken: "live-access",
+      refreshToken: "live-refresh",
+      expiresAt: Date.now() + 7 * hour,
+      scopes: ["user:profile"],
+    });
+    await otherStore.setActiveId(thisWindowProfile.id);
+    const usageCallsBefore = usageCalls;
+    const otherPoller = new UsagePoller(
+      otherStore,
+      new TokenRefresher(),
+      credentials,
+      () => 240,
+      () => undefined,
+      {
+        isProfileActive: () => true,
+        readActiveFileCreds: () => credentials.readCurrent(),
+      }
+    );
+    await otherPoller.pollOne(otherProfile.id, true);
+    check(
+      "never polls another window's profile with this window's credentials",
+      usageCalls === usageCallsBefore
+    );
+    check(
+      "reports why instead of attributing the wrong account's usage",
+      Boolean(otherStore.get(otherProfile.id)?.lastUsage?.error)
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }
 
@@ -586,7 +744,201 @@ async function runTokenRefresherTests(): Promise<void> {
   }
 }
 
+function stripCmdCarets(line: string): string {
+  let out = "";
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] === "^") {
+      i++;
+      if (i < line.length) out += line[i];
+      continue;
+    }
+    out += line[i];
+  }
+  return out;
+}
+
+function liveCmdMetacharacters(line: string): string[] {
+  const live: string[] = [];
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] === "^") {
+      i++;
+      continue;
+    }
+    if ('&|<>()"'.includes(line[i])) {
+      live.push(line[i]);
+    }
+  }
+  return live;
+}
+
+function runWindowsSpawnQuotingTests(): void {
+  console.log("Windows command quoting:");
+  const realPlatform = process.platform;
+  const setPlatform = (value: string) =>
+    Object.defineProperty(process, "platform", { value, configurable: true });
+
+  try {
+    setPlatform("linux");
+    const direct = buildSpawnArgs("/usr/bin/claude", ["-p", "Hi & calc"]);
+    check(
+      "runs the command directly off Windows, with no shell",
+      direct?.[0] === "/usr/bin/claude" && direct[1][1] === "Hi & calc"
+    );
+
+    setPlatform("win32");
+    const exe = buildSpawnArgs("C:\\tools\\claude.exe", ["-p", "Hi & calc"]);
+    check(
+      "runs a real executable directly on Windows too",
+      exe?.[0] === "C:\\tools\\claude.exe" && exe[1][1] === "Hi & calc"
+    );
+
+    const shim = buildSpawnArgs("C:\\tools\\claude.cmd", [
+      "-p",
+      'Hi" & calc & echo "',
+    ]);
+    check("routes a .cmd shim through cmd.exe", shim?.[0] === "cmd.exe");
+    const line = shim ? shim[1][2] : "";
+    check(
+      "an injected quote cannot end the quoted region",
+      liveCmdMetacharacters(line).length === 0
+    );
+    check(
+      "an injected command separator cannot reach cmd.exe",
+      !liveCmdMetacharacters(line).includes("&")
+    );
+    check(
+      "what cmd.exe hands on still carries the command's own quoting",
+      stripCmdCarets(line).includes('\\"') &&
+        stripCmdCarets(line).startsWith('call "C:\\tools\\claude.cmd"')
+    );
+
+    check(
+      "refuses an argument cmd.exe cannot quote (percent)",
+      buildSpawnArgs("C:\\tools\\claude.cmd", ["-p", "50% off"]) === null
+    );
+    check(
+      "refuses an argument cmd.exe cannot quote (newline)",
+      buildSpawnArgs("C:\\tools\\claude.cmd", ["-p", "a\nb"]) === null
+    );
+    check(
+      "a percent in an argument is refused, not passed to a real executable path",
+      buildSpawnArgs("C:\\tools\\claude.exe", ["-p", "50% off"]) !== null
+    );
+  } finally {
+    Object.defineProperty(process, "platform", {
+      value: realPlatform,
+      configurable: true,
+    });
+  }
+}
+
+function runCredentialsPathScopeTests(): void {
+  console.log("credentialsPath scope:");
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cas-scope-"));
+  const userPath = path.join(tmpDir, "user", ".credentials.json");
+  process.env.TEST_CRED_PATH = userPath;
+
+  const isolatedRoot = path.join(tmpDir, "account-configs");
+  const isolated = path.join(isolatedRoot, "profile-1", ".credentials.json");
+  const hostile = path.join(tmpDir, "checked-out-repo", ".credentials.json");
+  const mgr = new CredentialsManager(isolatedRoot);
+  const setScoped = (vscode as unknown as {
+    __setScopedCredentialsPath: (w?: string, f?: string) => void;
+  }).__setScopedCredentialsPath;
+
+  try {
+    setScoped(undefined, undefined);
+    check("uses the user-level setting when no workspace sets one", mgr.getCredentialsPath() === userPath);
+
+    setScoped(hostile, undefined);
+    check(
+      "ignores a workspace credentialsPath outside the extension's storage",
+      mgr.getCredentialsPath() === userPath
+    );
+
+    setScoped(undefined, hostile);
+    check(
+      "ignores a folder-scoped credentialsPath outside the extension's storage",
+      mgr.getCredentialsPath() === userPath
+    );
+
+    setScoped(path.join(isolatedRoot, "..", "escape", ".credentials.json"), undefined);
+    check(
+      "a workspace value cannot traverse out of the isolated storage root",
+      mgr.getCredentialsPath() === userPath
+    );
+
+    setScoped(isolated, undefined);
+    check(
+      "honours the isolated account config an independent window points at",
+      mgr.getCredentialsPath() === isolated
+    );
+
+    check(
+      "ignores every workspace value when no isolated root is configured",
+      new CredentialsManager().getCredentialsPath() === userPath
+    );
+  } finally {
+    setScoped(undefined, undefined);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+function runCredentialHygieneTests(): void {
+  console.log("Credential file hygiene:");
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cas-hygiene-"));
+  const credPath = path.join(tmpDir, ".credentials.json");
+  process.env.TEST_CRED_PATH = credPath;
+  const mgr = new CredentialsManager();
+  const creds = {
+    accessToken: "AAA",
+    refreshToken: "ra",
+    expiresAt: 111,
+    scopes: ["user:profile"],
+  };
+
+  try {
+    mgr.writeCreds(creds as never);
+    mgr.backupCurrent();
+    check(
+      "the switch backup is not readable by other users",
+      (fs.statSync(credPath + ".bak").mode & 0o077) === 0
+    );
+    mgr.restoreBackup();
+    mgr.discardBackup();
+    check("the switch backup is dropped once its undo is used", !mgr.hasBackup());
+
+    for (const stamp of ["20260101000001", "20260101000002", "20260101000003"]) {
+      fs.writeFileSync(`${credPath}.reauth-backup-${stamp}`, "{}", { mode: 0o600 });
+    }
+    mgr.writeCreds(creds as never);
+    const newest = mgr.moveCredentialsAside(undefined, "reauth-backup");
+    const remaining = fs
+      .readdirSync(tmpDir)
+      .filter((name) => name.includes(".reauth-backup-"));
+    check("old set-aside credential files are pruned", remaining.length === 2);
+    check(
+      "pruning keeps the newest, not the oldest",
+      remaining.includes(path.basename(newest as string)) &&
+        !remaining.some((name) => name.endsWith("20260101000001"))
+    );
+    check(
+      "a set-aside credential file is not readable by other users",
+      (fs.statSync(newest as string).mode & 0o077) === 0
+    );
+
+    mgr.writeCreds(creds as never);
+    mgr.removeCredentials();
+    check("an isolated credential copy can be removed", mgr.readCurrent() === null);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
 runProfileActivityTests();
+runWindowsSpawnQuotingTests();
+runCredentialsPathScopeTests();
+runCredentialHygieneTests();
 runBrowserOAuthTests();
 runAccountStoreTests()
   .then(runUsagePollerTests)

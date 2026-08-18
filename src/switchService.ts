@@ -109,6 +109,7 @@ export class SwitchService {
     const restored = this.credentials.readCurrent();
     const matched = restored ? await this.store.findByTokens(restored) : undefined;
     await this.store.setActiveId(matched);
+    this.credentials.discardBackup();
 
     await this.maybeReload("Restored the previous account.");
     return { ok: true, message: "Restored the previous account." };

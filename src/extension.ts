@@ -14,7 +14,7 @@ import {
   shouldPreferCredentialCandidate,
 } from "./credentialValidation";
 import { CredentialsManager } from "./credentials";
-import { getAccountConfigDir } from "./isolatedConfig";
+import { getAccountConfigDir, getAccountConfigRoot } from "./isolatedConfig";
 import { TokenRefresher } from "./oauth";
 import { ProfileActivityRegistry } from "./profileActivity";
 import { SwitchService } from "./switchService";
@@ -26,7 +26,7 @@ import { WarmupService } from "./warmup";
 
 export function activate(context: vscode.ExtensionContext): void {
   const store = new AccountStore(context);
-  const credentials = new CredentialsManager();
+  const credentials = new CredentialsManager(getAccountConfigRoot(context));
   const refresher = new TokenRefresher();
   const browserOAuth = new BrowserOAuthLogin();
   const profileActivity = new ProfileActivityRegistry(context);
@@ -287,6 +287,7 @@ export function activate(context: vscode.ExtensionContext): void {
     refreshUI,
     {
       readProfileCreds: (id) => credentials.readCurrent(getAccountConfigDir(context, id)),
+      readActiveFileCreds: () => credentials.readCurrent(),
       syncCurrentProfile: synchronizeCurrentProfile,
       isProfileActive: (id) => profileActivity.isActive(id),
       persistRefreshedCreds: (id, previous, next) => {
@@ -314,6 +315,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const res = await switchService.captureCurrent();
       vscode.window[res.ok ? "showInformationMessage" : "showWarningMessage"](res.message);
       if (res.ok) {
+        await backfillKnownIdentities().catch(() => undefined);
         const activeId = store.getActiveId();
         profileActivity.setActiveProfile(activeId);
         if (activeId) {
@@ -540,6 +542,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   void synchronizeCurrentProfile()
     .catch(() => undefined)
+    .then(() => backfillKnownIdentities().catch(() => undefined))
     .then(() => {
       refreshUI();
       poller.start();

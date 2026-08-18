@@ -1,12 +1,13 @@
 import { spawn } from "child_process";
 import * as fs from "fs";
-import * as path from "path";
 import * as vscode from "vscode";
 import { AccountStore } from "./accountStore";
 import {
+  buildSpawnArgs,
   getConfiguredClaudeCommand,
   missingClaudeCliMessage,
   resolveClaudeCommand,
+  unsafeCommandArgumentMessage,
 } from "./cli";
 import { hasUsableOAuthCreds } from "./credentialValidation";
 import { CredentialsManager } from "./credentials";
@@ -87,64 +88,76 @@ export class WarmupService {
         };
       }
       const configDir = this.getProfileConfigDir(id);
-      fs.mkdirSync(configDir, { recursive: true });
+      fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
       this.credentials.writeCreds(latestCreds, configDir);
 
-      const configuredCommand = getConfiguredClaudeCommand();
-      const command = resolveClaudeCommand(configuredCommand);
-      if (!command) {
-        return {
-          ok: false,
-          message: `"${profile.label}" Say Hi failed: ${missingClaudeCliMessage()}`,
-        };
+      // Kept only while a rotation might exist nowhere else: this file is the
+      // recovery path readProfileCreds uses if persisting it fails.
+      let persisted = true;
+      try {
+        const configuredCommand = getConfiguredClaudeCommand();
+        const command = resolveClaudeCommand(configuredCommand);
+        if (!command) {
+          return {
+            ok: false,
+            message: `"${profile.label}" Say Hi failed: ${missingClaudeCliMessage()}`,
+          };
+        }
+
+        const cfg = vscode.workspace.getConfiguration("claudeSwitcher");
+        const model = cfg.get<string>("sayHiModel", "haiku").trim() || "haiku";
+        const prompt = cfg.get<string>("sayHiPrompt", "Hi").trim() || "Hi";
+        const timeoutMs = Math.max(15, cfg.get<number>("sayHiTimeoutSeconds", 120)) * 1000;
+
+        const result = await runClaude(
+          command,
+          [
+            "-p",
+            prompt,
+            "--model",
+            model,
+            "--max-turns",
+            "1",
+            "--no-session-persistence",
+            "--disallowedTools",
+            "*",
+          ],
+          { CLAUDE_CONFIG_DIR: configDir },
+          vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd(),
+          timeoutMs
+        );
+
+        const updatedCreds = this.credentials.readCurrent(configDir);
+        if (updatedCreds) {
+          persisted = false;
+          await this.store.updateCreds(id, updatedCreds);
+          persisted = true;
+        }
+
+        if (result.timedOut) {
+          return {
+            ok: false,
+            message: `"${profile.label}" Say Hi timed out after ${Math.round(timeoutMs / 1000)}s.`,
+          };
+        }
+
+        if (result.code !== 0) {
+          const details = (result.stderr || result.stdout).trim().slice(0, 300);
+          return {
+            ok: false,
+            message:
+              `"${profile.label}" Say Hi failed` +
+              (details ? `: ${details}` : ` with exit code ${result.code ?? "unknown"}.`),
+          };
+        }
+
+        return { ok: true, message: `Say Hi completed for "${profile.label}".` };
+      } finally {
+        // Say Hi refuses to run against an active profile, so nothing else reads this.
+        if (persisted) {
+          this.credentials.removeCredentials(configDir);
+        }
       }
-
-      const cfg = vscode.workspace.getConfiguration("claudeSwitcher");
-      const model = cfg.get<string>("sayHiModel", "haiku").trim() || "haiku";
-      const prompt = cfg.get<string>("sayHiPrompt", "Hi").trim() || "Hi";
-      const timeoutMs = Math.max(15, cfg.get<number>("sayHiTimeoutSeconds", 120)) * 1000;
-
-      const result = await runClaude(
-        command,
-        [
-          "-p",
-          prompt,
-          "--model",
-          model,
-          "--max-turns",
-          "1",
-          "--no-session-persistence",
-          "--disallowedTools",
-          "*",
-        ],
-        { CLAUDE_CONFIG_DIR: configDir },
-        vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd(),
-        timeoutMs
-      );
-
-      const updatedCreds = this.credentials.readCurrent(configDir);
-      if (updatedCreds) {
-        await this.store.updateCreds(id, updatedCreds);
-      }
-
-      if (result.timedOut) {
-        return {
-          ok: false,
-          message: `"${profile.label}" Say Hi timed out after ${Math.round(timeoutMs / 1000)}s.`,
-        };
-      }
-
-      if (result.code !== 0) {
-        const details = (result.stderr || result.stdout).trim().slice(0, 300);
-        return {
-          ok: false,
-          message:
-            `"${profile.label}" Say Hi failed` +
-            (details ? `: ${details}` : ` with exit code ${result.code ?? "unknown"}.`),
-        };
-      }
-
-      return { ok: true, message: `Say Hi completed for "${profile.label}".` };
     });
 
     if (!locked.acquired) {
@@ -171,7 +184,19 @@ function runClaude(
   timeoutMs: number
 ): Promise<RunResult> {
   return new Promise((resolve) => {
-    const child = spawn(...buildSpawnArgs(command, args), {
+    const spawnArgs = buildSpawnArgs(command, args);
+    if (!spawnArgs) {
+      resolve({
+        code: -1,
+        signal: null,
+        stdout: "",
+        stderr: unsafeCommandArgumentMessage(),
+        timedOut: false,
+      });
+      return;
+    }
+
+    const child = spawn(...spawnArgs, {
       cwd,
       env: { ...process.env, ...extraEnv },
       shell: false,
@@ -202,26 +227,4 @@ function runClaude(
       resolve({ code, signal, stdout, stderr, timedOut });
     });
   });
-}
-
-function buildSpawnArgs(command: string, args: string[]): [string, string[]] {
-  if (process.platform !== "win32") {
-    return [command, args];
-  }
-
-  if (!isWindowsShellScript(command)) {
-    return [command, args];
-  }
-
-  const line = ["call", quoteCmdArg(command), ...args.map(quoteCmdArg)].join(" ");
-  return ["cmd.exe", ["/d", "/c", line]];
-}
-
-function isWindowsShellScript(command: string): boolean {
-  const ext = path.extname(command).toLowerCase();
-  return ext === ".cmd" || ext === ".bat";
-}
-
-function quoteCmdArg(arg: string): string {
-  return `"${arg.replace(/"/g, '\\"')}"`;
 }
