@@ -34,6 +34,55 @@ export function missingClaudeCliMessage(): string {
   ].join(" ");
 }
 
+/**
+ * Builds the `spawn` arguments for the Claude CLI. A Windows `.cmd`/`.bat` shim
+ * goes through `cmd.exe /c`, which parses the line before the command's own argv
+ * parser does; returns null when an argument cannot be quoted for both.
+ */
+export function buildSpawnArgs(
+  command: string,
+  args: string[]
+): [string, string[]] | null {
+  if (process.platform !== "win32" || !isWindowsShellScript(command)) {
+    return [command, args];
+  }
+
+  const parts: string[] = [];
+  for (const value of ["call", command, ...args]) {
+    const quoted = value === "call" ? value : quoteCmdArg(value);
+    if (quoted === null) {
+      return null;
+    }
+    parts.push(quoted);
+  }
+  return ["cmd.exe", ["/d", "/c", parts.join(" ")]];
+}
+
+export function unsafeCommandArgumentMessage(): string {
+  return (
+    "A Claude command argument contains a character that cmd.exe cannot quote " +
+    "safely (a newline or '%'). Adjust claudeSwitcher.sayHiPrompt, " +
+    "claudeSwitcher.sayHiModel or claudeSwitcher.claudeCommand and try again."
+  );
+}
+
+function isWindowsShellScript(command: string): boolean {
+  const ext = path.extname(command).toLowerCase();
+  return ext === ".cmd" || ext === ".bat";
+}
+
+function quoteCmdArg(arg: string): string | null {
+  // cmd.exe expands `%` before any escaping applies, and a newline ends the line.
+  if (/[%\r\n]/.test(arg)) {
+    return null;
+  }
+
+  // Escape for the command's argv parser, then caret-escape for cmd.exe itself:
+  // cmd does not honour `\"`, so a quote would otherwise end the quoted region.
+  const escaped = arg.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, "$1$1");
+  return `"${escaped}"`.replace(/[()<>&|^"]/g, "^$&");
+}
+
 export function quoteForTerminal(command: string): string {
   if (process.platform === "win32") {
     return command.includes(" ") ? `"${command.replace(/"/g, '\\"')}"` : command;

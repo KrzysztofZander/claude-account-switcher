@@ -65,7 +65,7 @@ export class AccountWindowService {
 
     this.profileActivity?.markPending(id);
     const configDir = getAccountConfigDir(this.context, id);
-    fs.mkdirSync(configDir, { recursive: true });
+    fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
     const fileCreds = this.credentials.readCurrent(configDir);
     if (fileCreds && shouldPreferCredentialCandidate(fileCreds, creds)) {
       creds = fileCreds;

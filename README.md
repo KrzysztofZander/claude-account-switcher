@@ -87,16 +87,25 @@ irm https://claude.ai/install.ps1 | iex
 
 ## Settings
 
-| Key | Default | Description |
-| --- | --- | --- |
-| `claudeSwitcher.pollIntervalSeconds` | `240` | auto-refresh interval (min 180) |
-| `claudeSwitcher.autoReloadAfterSwitch` | `false` | auto-reload the window after switching |
-| `claudeSwitcher.credentialsPath` | `""` | override the path to `.credentials.json` |
-| `claudeSwitcher.warnThresholdPercent` | `80` | warning threshold (% → red bar) |
-| `claudeSwitcher.claudeCommand` | `claude` | CLI command used for CLI login and Say Hi; set the full path if VS Code cannot find it |
-| `claudeSwitcher.sayHiModel` | `haiku` | model alias passed to `claude -p` |
-| `claudeSwitcher.sayHiPrompt` | `Hi` | prompt used by Say Hi |
-| `claudeSwitcher.sayHiTimeoutSeconds` | `120` | Say Hi timeout |
+| Key | Default | Scope | Description |
+| --- | --- | --- | --- |
+| `claudeSwitcher.pollIntervalSeconds` | `240` | window | auto-refresh interval (min 180) |
+| `claudeSwitcher.autoReloadAfterSwitch` | `false` | window | auto-reload the window after switching |
+| `claudeSwitcher.credentialsPath` | `""` | window\* | override the path to `.credentials.json` |
+| `claudeSwitcher.warnThresholdPercent` | `80` | window | warning threshold (% → red bar) |
+| `claudeSwitcher.claudeCommand` | `claude` | machine | CLI command used for CLI login and Say Hi; set the full path if VS Code cannot find it |
+| `claudeSwitcher.sayHiModel` | `haiku` | machine | model alias passed to `claude -p` |
+| `claudeSwitcher.sayHiPrompt` | `Hi` | machine | prompt used by Say Hi |
+| `claudeSwitcher.sayHiTimeoutSeconds` | `120` | machine | Say Hi timeout |
+
+The four **machine**-scoped settings can only be set in your user settings. They choose which
+executable is run and what is passed to it, so a workspace you open must not be able to change
+them.
+
+\* `credentialsPath` can be set by a workspace, but only to a path inside the extension's own
+per-account storage — that is what independent account windows use. Any other workspace value is
+ignored and your user-level setting applies instead, because this path is both read from and
+written to when you switch accounts.
 
 ## Troubleshooting Say Hi
 
@@ -132,9 +141,13 @@ account. Independent windows avoid that by setting both:
       "value": "C:\\Users\\you\\.claude-user2"
     }
   ],
-  "claudeSwitcher.credentialsPath": "C:\\Users\\you\\.claude-user2\\.credentials.json"
+  "claudeSwitcher.credentialsPath": "<extension global storage>\\account-configs\\<profile-id>\\.credentials.json"
 }
 ```
+
+Let the extension generate these windows. A hand-written workspace can still point Claude Code at
+any `CLAUDE_CONFIG_DIR`, but `claudeSwitcher.credentialsPath` is only honoured from a workspace when
+it stays inside the extension's own per-account storage.
 
 Open one generated window per account you want to run. The extension refuses to open a second
 active window for the same saved profile, because the upstream refresh token belongs to that
@@ -151,6 +164,10 @@ account and can rotate.
   and independent windows, the extension writes credentials only to local Claude Code config
   directories on your machine, including isolated per-account `CLAUDE_CONFIG_DIR` folders under
   the extension's global storage.
+- Local credential copies are kept to a minimum: the switch backup is dropped once its undo has
+  been used, files set aside by a repair login are pruned to the newest two, and the plaintext copy
+  written for a Say Hi warmup is removed as soon as the run finishes. Every one of them is written
+  `0600`, in directories created `0700`.
 - Credentials are never intentionally logged. Protect your machine and OS user account, because
   anyone with local filesystem access to your user profile may be able to read Claude Code
   credential files.

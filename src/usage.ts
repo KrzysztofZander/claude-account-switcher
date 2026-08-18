@@ -12,6 +12,9 @@ import { OAuthCreds, UsageSnapshot, UsageWindow } from "./types";
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 const USER_AGENT = "claude-code/2.0.14";
 const BACKOFF_429_MS = 300_000; // 5 min after hitting the request rate limit
+const STALE_ACTIVE_PROFILE_ERROR =
+  "Saved tokens for this profile are out of date and Claude Code's current login " +
+  "could not be read. Save the current account again, or reauthorize this profile.";
 
 interface RawWindow {
   utilization?: number;
@@ -110,6 +113,8 @@ export interface UsagePollerCoordination {
   syncCurrentProfile?: () => Promise<void>;
   /** True while Claude Code owns this profile in any live VS Code window. */
   isProfileActive?: (id: string) => boolean;
+  /** Reads the credentials file Claude Code is using in this window. */
+  readActiveFileCreds?: () => OAuthCreds | null;
   /** Propagates a successful rotation to local credential replicas using compare-and-swap. */
   persistRefreshedCreds?: (
     id: string,
@@ -183,15 +188,27 @@ export class UsagePoller {
 
   async pollAll(force: boolean): Promise<void> {
     // First sync the active profile from the file (fresh tokens).
-    if (this.coordination.syncCurrentProfile) {
-      await this.coordination.syncCurrentProfile();
-    } else {
-      await this.store.syncActiveFromFile(this.credentials.readCurrent());
+    try {
+      if (this.coordination.syncCurrentProfile) {
+        await this.coordination.syncCurrentProfile();
+      } else {
+        await this.store.syncActiveFromFile(this.credentials.readCurrent());
+      }
+    } catch {
+      /* each profile still polls below and records its own failure */
     }
 
     const profiles = this.store.list();
     for (const profile of profiles) {
-      await this.pollOne(profile.id, force);
+      try {
+        await this.pollOne(profile.id, force);
+      } catch (e) {
+        await this.recordFailure(
+          profile.id,
+          this.store.get(profile.id)?.lastUsage,
+          "Usage poll failed: " + (e as Error).message
+        );
+      }
     }
     this.onUpdate();
   }
@@ -209,6 +226,11 @@ export class UsagePoller {
 
     let creds = await this.store.getCreds(id);
     if (!creds) {
+      await this.recordFailure(
+        id,
+        profile.lastUsage,
+        "No stored credentials for this profile. Reauthorize this account profile."
+      );
       return;
     }
     // Always reconcile the per-profile file before honoring a previous auth error.
@@ -225,15 +247,15 @@ export class UsagePoller {
     }
 
     // Refresh an expired token (it rotates, so save the new one).
-    if (TokenRefresher.isExpired(creds)) {
-      if (this.isProfileActive(id)) {
-        await this.syncActiveProfile();
-        const synced = await this.store.getCreds(id);
-        if (!synced || TokenRefresher.isExpired(synced)) {
-          return;
-        }
-        creds = synced;
+    if (TokenRefresher.isExpired(creds) && this.isProfileActive(id)) {
+      await this.syncActiveProfile();
+      const synced = await this.store.getCreds(id);
+      const usable = this.firstUsable([synced, this.activeFileCreds(id)]);
+      if (!usable) {
+        await this.recordFailure(id, prev, STALE_ACTIVE_PROFILE_ERROR);
+        return;
       }
+      creds = usable;
     }
 
     if (TokenRefresher.isExpired(creds)) {
@@ -249,10 +271,12 @@ export class UsagePoller {
       if (this.isProfileActive(id)) {
         await this.syncActiveProfile();
         const synced = await this.store.getCreds(id);
-        if (!synced || !credentialsChanged(creds, synced)) {
+        const retry = this.firstUsable([synced, this.activeFileCreds(id)], creds);
+        if (!retry) {
+          await this.recordFailure(id, prev, STALE_ACTIVE_PROFILE_ERROR);
           return;
         }
-        creds = synced;
+        creds = retry;
         result = await fetchUsage(creds);
       } else {
         const refreshed = await this.refreshCreds(id, creds, true, prev);
@@ -266,14 +290,61 @@ export class UsagePoller {
     if (result.snapshot) {
       await this.store.updateUsage(id, result.snapshot);
     } else {
-      await this.store.updateUsage(id, {
-        fetchedAt: Date.now(),
-        windows: prev?.windows ?? [],
-        sessionPercent: prev?.sessionPercent ?? null,
-        weeklyPercent: prev?.weeklyPercent ?? null,
-        error: result.error ?? "Failed to fetch usage",
-        retryAfter: result.retryAfter,
-      });
+      await this.recordFailure(
+        id,
+        prev,
+        result.error ?? "Failed to fetch usage",
+        result.retryAfter
+      );
+    }
+  }
+
+  /** Records a failed poll. Every unsuccessful path must land here. */
+  private async recordFailure(
+    id: string,
+    prev: UsageSnapshot | undefined,
+    error: string,
+    retryAfter?: number
+  ): Promise<void> {
+    await this.store.updateUsage(id, {
+      fetchedAt: Date.now(),
+      windows: prev?.windows ?? [],
+      sessionPercent: prev?.sessionPercent ?? null,
+      weeklyPercent: prev?.weeklyPercent ?? null,
+      error,
+      retryAfter,
+    });
+  }
+
+  private firstUsable(
+    candidates: (OAuthCreds | null | undefined)[],
+    rejected?: OAuthCreds
+  ): OAuthCreds | null {
+    for (const candidate of candidates) {
+      if (!candidate || !hasUsableOAuthCreds(candidate)) {
+        continue;
+      }
+      if (TokenRefresher.isExpired(candidate)) {
+        continue;
+      }
+      if (rejected && !credentialsChanged(rejected, candidate)) {
+        continue;
+      }
+      return candidate;
+    }
+    return null;
+  }
+
+  /** The live Claude Code login. Reading it spends no refresh token. */
+  private activeFileCreds(id: string): OAuthCreds | null {
+    // isProfileActive also covers other windows, whose file this is not.
+    if (this.store.getActiveId() !== id) {
+      return null;
+    }
+    try {
+      return this.coordination.readActiveFileCreds?.() ?? null;
+    } catch {
+      return null;
     }
   }
 
@@ -321,27 +392,22 @@ export class UsagePoller {
     });
 
     if (!locked.acquired) {
-      await this.store.updateUsage(id, {
-        fetchedAt: Date.now(),
-        windows: prev?.windows ?? [],
-        sessionPercent: prev?.sessionPercent ?? null,
-        weeklyPercent: prev?.weeklyPercent ?? null,
-        error: "Skipped token refresh because another VS Code window is refreshing it.",
-      });
+      await this.recordFailure(
+        id,
+        prev,
+        "Skipped token refresh because another VS Code window is refreshing it."
+      );
       return null;
     }
 
     if (!locked.value?.ok) {
-      if (locked.value?.deferred) {
-        return null;
-      }
-      await this.store.updateUsage(id, {
-        fetchedAt: Date.now(),
-        windows: prev?.windows ?? [],
-        sessionPercent: prev?.sessionPercent ?? null,
-        weeklyPercent: prev?.weeklyPercent ?? null,
-        error: locked.value?.error ?? "Failed to refresh token.",
-      });
+      await this.recordFailure(
+        id,
+        prev,
+        locked.value?.deferred
+          ? "Skipped token refresh because Claude Code owns this profile right now."
+          : locked.value?.error ?? "Failed to refresh token."
+      );
       return null;
     }
 
