@@ -1,3 +1,4 @@
+import * as crypto from "crypto";
 import * as vscode from "vscode";
 import { AccountStore } from "../accountStore";
 import { hasUsableOAuthCreds } from "../credentialValidation";
@@ -189,10 +190,7 @@ function displayUsageError(
 }
 
 function getNonce(): string {
-  let text = "";
-  const possible = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  for (let i = 0; i < 32; i++) {
-    text += possible.charAt(Math.floor(Math.random() * possible.length));
-  }
-  return text;
+  // A CSP nonce is only as good as its unpredictability; Math.random is not a
+  // cryptographic source and its state can be inferred from earlier outputs.
+  return crypto.randomBytes(24).toString("base64");
 }

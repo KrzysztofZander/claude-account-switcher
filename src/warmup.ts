@@ -1,12 +1,13 @@
 import { spawn } from "child_process";
 import * as fs from "fs";
-import * as path from "path";
 import * as vscode from "vscode";
 import { AccountStore } from "./accountStore";
 import {
+  buildSpawnArgs,
   getConfiguredClaudeCommand,
   missingClaudeCliMessage,
   resolveClaudeCommand,
+  unsafeCommandArgumentMessage,
 } from "./cli";
 import { hasUsableOAuthCreds } from "./credentialValidation";
 import { CredentialsManager } from "./credentials";
@@ -87,7 +88,7 @@ export class WarmupService {
         };
       }
       const configDir = this.getProfileConfigDir(id);
-      fs.mkdirSync(configDir, { recursive: true });
+      fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
       this.credentials.writeCreds(latestCreds, configDir);
 
       const configuredCommand = getConfiguredClaudeCommand();
@@ -126,6 +127,11 @@ export class WarmupService {
       if (updatedCreds) {
         await this.store.updateCreds(id, updatedCreds);
       }
+      // The warmup process has exited and any rotation it performed is now in
+      // SecretStorage, so the plaintext copy this run wrote has no reader left.
+      // A profile held by a live account window never reaches here — Say Hi
+      // refuses to run against an active profile.
+      this.credentials.removeCredentials(configDir);
 
       if (result.timedOut) {
         return {
@@ -171,7 +177,19 @@ function runClaude(
   timeoutMs: number
 ): Promise<RunResult> {
   return new Promise((resolve) => {
-    const child = spawn(...buildSpawnArgs(command, args), {
+    const spawnArgs = buildSpawnArgs(command, args);
+    if (!spawnArgs) {
+      resolve({
+        code: -1,
+        signal: null,
+        stdout: "",
+        stderr: unsafeCommandArgumentMessage(),
+        timedOut: false,
+      });
+      return;
+    }
+
+    const child = spawn(...spawnArgs, {
       cwd,
       env: { ...process.env, ...extraEnv },
       shell: false,
@@ -202,26 +220,4 @@ function runClaude(
       resolve({ code, signal, stdout, stderr, timedOut });
     });
   });
-}
-
-function buildSpawnArgs(command: string, args: string[]): [string, string[]] {
-  if (process.platform !== "win32") {
-    return [command, args];
-  }
-
-  if (!isWindowsShellScript(command)) {
-    return [command, args];
-  }
-
-  const line = ["call", quoteCmdArg(command), ...args.map(quoteCmdArg)].join(" ");
-  return ["cmd.exe", ["/d", "/c", line]];
-}
-
-function isWindowsShellScript(command: string): boolean {
-  const ext = path.extname(command).toLowerCase();
-  return ext === ".cmd" || ext === ".bat";
-}
-
-function quoteCmdArg(arg: string): string {
-  return `"${arg.replace(/"/g, '\\"')}"`;
 }

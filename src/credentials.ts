@@ -9,24 +9,68 @@ import {
 } from "./credentialValidation";
 import { CredentialsFile, OAuthCreds } from "./types";
 
+/** How many `.reauth-backup-*` files to keep per credentials file. */
+const KEPT_SET_ASIDE_CREDENTIALS = 2;
+
 /**
  * Reads and writes the Claude Code credentials file (~/.claude/.credentials.json).
  * Switching accounts = swapping the contents of this file.
  */
 export class CredentialsManager {
+  /**
+   * @param isolatedConfigRoot Directory holding this extension's own per-profile
+   * Claude configs. It is the only location a workspace-scoped `credentialsPath`
+   * may point at — see `configuredCredentialsPath`.
+   */
+  constructor(private readonly isolatedConfigRoot?: string) {}
+
   getCredentialsPath(configDir?: string): string {
     if (configDir) {
       return path.join(configDir, ".credentials.json");
     }
 
-    const override = vscode.workspace
-      .getConfiguration("claudeSwitcher")
-      .get<string>("credentialsPath", "")
-      .trim();
+    const override = this.configuredCredentialsPath();
     if (override) {
       return override;
     }
     return path.join(os.homedir(), ".claude", ".credentials.json");
+  }
+
+  /**
+   * Resolves the `credentialsPath` setting, honouring a workspace-scoped value
+   * only when it points inside this extension's own isolated config storage —
+   * which is where the extension itself writes one, for independent account
+   * windows. Any other workspace value is ignored: this path is both read from
+   * and written to on a switch, so accepting it from a repository would let that
+   * repository choose where your OAuth tokens land.
+   */
+  private configuredCredentialsPath(): string {
+    const cfg = vscode.workspace.getConfiguration("claudeSwitcher");
+    const inspected = cfg.inspect
+      ? cfg.inspect<string>("credentialsPath")
+      : undefined;
+    if (!inspected) {
+      return trimmedValue(cfg.get<string>("credentialsPath", ""));
+    }
+
+    for (const scoped of [inspected.workspaceFolderValue, inspected.workspaceValue]) {
+      const value = trimmedValue(scoped);
+      if (value && this.isIsolatedAccountConfig(value)) {
+        return value;
+      }
+    }
+    return trimmedValue(inspected.globalValue);
+  }
+
+  private isIsolatedAccountConfig(candidate: string): boolean {
+    if (!this.isolatedConfigRoot) {
+      return false;
+    }
+    const normalize = (value: string) =>
+      process.platform === "win32"
+        ? path.resolve(value).toLowerCase()
+        : path.resolve(value);
+    return normalize(candidate).startsWith(normalize(this.isolatedConfigRoot) + path.sep);
   }
 
   getConfigDir(): string {
@@ -78,7 +122,7 @@ export class CredentialsManager {
 
     const p = this.getCredentialsPath(configDir);
     const dir = path.dirname(p);
-    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 
     const existing = this.readRawFile(configDir) ?? ({} as CredentialsFile);
     const next: CredentialsFile = { ...existing, claudeAiOauth: creds };
@@ -112,22 +156,53 @@ export class CredentialsManager {
     return true;
   }
 
+  /**
+   * Deletes a credentials file. Used to drop the plaintext copy written into a
+   * profile's isolated config once its tokens are back in SecretStorage.
+   */
+  removeCredentials(configDir?: string): void {
+    try {
+      fs.rmSync(this.getCredentialsPath(configDir), { force: true });
+    } catch {
+      /* already absent */
+    }
+  }
+
   private backupPath(): string {
     return this.getCredentialsPath() + ".bak";
   }
 
-  /** Copies the current file to .bak (enables undoing a switch). */
+  /**
+   * Copies the current file to .bak (enables undoing a switch). The copy holds a
+   * full working token set for whichever account is being switched away from, so
+   * it is re-secured explicitly: copyFileSync keeps the *destination's* mode when
+   * the backup already exists, which would leave an earlier, laxer mode in place.
+   */
   backupCurrent(): boolean {
     const p = this.getCredentialsPath();
     try {
       if (fs.existsSync(p)) {
         fs.copyFileSync(p, this.backupPath());
+        try {
+          fs.chmodSync(this.backupPath(), 0o600);
+        } catch {
+          /* best-effort on Windows */
+        }
         return true;
       }
     } catch {
       /* ignore */
     }
     return false;
+  }
+
+  /** Removes the switch backup once it has served its purpose. */
+  discardBackup(): void {
+    try {
+      fs.rmSync(this.backupPath(), { force: true });
+    } catch {
+      /* already absent */
+    }
   }
 
   hasBackup(): boolean {
@@ -157,16 +232,48 @@ export class CredentialsManager {
   moveCredentialsAside(configDir?: string, reason = "backup"): string | null {
     const p = this.getCredentialsPath(configDir);
     try {
-      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
       if (!fs.existsSync(p)) {
         return null;
       }
       const stamp = new Date().toISOString().replace(/\D/g, "").slice(0, 14);
       const target = `${p}.${reason}-${stamp}`;
       fs.renameSync(p, target);
+      try {
+        fs.chmodSync(target, 0o600);
+      } catch {
+        /* best-effort on Windows */
+      }
+      this.pruneSetAsideCredentials(p, reason);
       return target;
     } catch (e) {
       throw new Error("Failed to move existing credentials aside: " + (e as Error).message);
     }
   }
+
+  /**
+   * Keeps only the newest few set-aside credential files. Every one of them is a
+   * complete, plaintext token set, and one is written per repair login — left
+   * alone they pile up indefinitely for no added recovery value.
+   */
+  private pruneSetAsideCredentials(credentialsPath: string, reason: string): void {
+    const dir = path.dirname(credentialsPath);
+    const prefix = path.basename(credentialsPath) + `.${reason}-`;
+    try {
+      const stale = fs
+        .readdirSync(dir)
+        .filter((name) => name.startsWith(prefix))
+        .sort()
+        .slice(0, -KEPT_SET_ASIDE_CREDENTIALS);
+      for (const name of stale) {
+        fs.rmSync(path.join(dir, name), { force: true });
+      }
+    } catch {
+      /* pruning is best-effort; it must never fail the reauthorization */
+    }
+  }
+}
+
+function trimmedValue(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
 }

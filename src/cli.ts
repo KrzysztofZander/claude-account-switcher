@@ -34,6 +34,72 @@ export function missingClaudeCliMessage(): string {
   ].join(" ");
 }
 
+/**
+ * Builds the `spawn` arguments for the Claude CLI.
+ *
+ * On Windows a `.cmd`/`.bat` shim cannot be executed directly, so it has to go
+ * through `cmd.exe /c` — and that puts two parsers in series: cmd.exe reads the
+ * line first, then the command applies the C runtime's argv rules. Quoting only
+ * for the second parser is what makes this dangerous: cmd.exe does not honour
+ * `\"`, so a quote inside a value ends the quoted region and any `&` or `|`
+ * after it is run by cmd as a separate command.
+ *
+ * Returns null when an argument contains something cmd.exe cannot be made to
+ * treat as data (newlines, or `%` which is expanded before any escaping
+ * applies). Callers report that instead of running a command they cannot
+ * predict. On every other platform the command is executed directly, with no
+ * shell involved, so no escaping is needed.
+ */
+export function buildSpawnArgs(
+  command: string,
+  args: string[]
+): [string, string[]] | null {
+  if (process.platform !== "win32" || !isWindowsShellScript(command)) {
+    return [command, args];
+  }
+
+  const parts: string[] = [];
+  for (const value of ["call", command, ...args]) {
+    const quoted = value === "call" ? value : quoteCmdArg(value);
+    if (quoted === null) {
+      return null;
+    }
+    parts.push(quoted);
+  }
+  return ["cmd.exe", ["/d", "/c", parts.join(" ")]];
+}
+
+export function unsafeCommandArgumentMessage(): string {
+  return (
+    "A Claude command argument contains a character that cmd.exe cannot quote " +
+    "safely (a newline or '%'). Adjust claudeSwitcher.sayHiPrompt, " +
+    "claudeSwitcher.sayHiModel or claudeSwitcher.claudeCommand and try again."
+  );
+}
+
+function isWindowsShellScript(command: string): boolean {
+  const ext = path.extname(command).toLowerCase();
+  return ext === ".cmd" || ext === ".bat";
+}
+
+function quoteCmdArg(arg: string): string | null {
+  // `%` is expanded by cmd.exe before any escaping is considered, and a newline
+  // ends the command line outright. Neither can be neutralized here.
+  if (/[%\r\n]/.test(arg)) {
+    return null;
+  }
+
+  // Layer 1 — the C runtime's argv rules: escape quotes and double any run of
+  // backslashes that precedes one (or ends the value, where the closing quote
+  // would otherwise consume them).
+  const escaped = arg.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, "$1$1");
+
+  // Layer 2 — cmd.exe's own parser. Caret-escape every metacharacter, the
+  // surrounding quotes included, so cmd passes the whole token through as data
+  // and only the command itself interprets the quoting above.
+  return `"${escaped}"`.replace(/[()<>&|^"]/g, "^$&");
+}
+
 export function quoteForTerminal(command: string): string {
   if (process.platform === "win32") {
     return command.includes(" ") ? `"${command.replace(/"/g, '\\"')}"` : command;

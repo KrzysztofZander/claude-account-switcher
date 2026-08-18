@@ -109,6 +109,9 @@ export class SwitchService {
     const restored = this.credentials.readCurrent();
     const matched = restored ? await this.store.findByTokens(restored) : undefined;
     await this.store.setActiveId(matched);
+    // The backup is now a second plaintext copy of the account that was just
+    // restored, and the one undo it existed for has happened.
+    this.credentials.discardBackup();
 
     await this.maybeReload("Restored the previous account.");
     return { ok: true, message: "Restored the previous account." };

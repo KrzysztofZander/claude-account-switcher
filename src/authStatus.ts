@@ -1,9 +1,10 @@
 import { spawn } from "child_process";
-import * as path from "path";
 import {
+  buildSpawnArgs,
   getConfiguredClaudeCommand,
   missingClaudeCliMessage,
   resolveClaudeCommand,
+  unsafeCommandArgumentMessage,
 } from "./cli";
 import { ClaudeAuthIdentity } from "./types";
 
@@ -54,7 +55,13 @@ function runClaudeStatus(
   configDir: string | undefined
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    const child = spawn(...buildSpawnArgs(command, ["auth", "status", "--json"]), {
+    const spawnArgs = buildSpawnArgs(command, ["auth", "status", "--json"]);
+    if (!spawnArgs) {
+      resolve({ code: -1, stdout: "", stderr: unsafeCommandArgumentMessage() });
+      return;
+    }
+
+    const child = spawn(...spawnArgs, {
       env: configDir ? { ...process.env, CLAUDE_CONFIG_DIR: configDir } : process.env,
       shell: false,
       windowsHide: true,
@@ -75,28 +82,6 @@ function runClaudeStatus(
       resolve({ code, stdout, stderr });
     });
   });
-}
-
-function buildSpawnArgs(command: string, args: string[]): [string, string[]] {
-  if (process.platform !== "win32") {
-    return [command, args];
-  }
-
-  if (!isWindowsShellScript(command)) {
-    return [command, args];
-  }
-
-  const line = ["call", quoteCmdArg(command), ...args.map(quoteCmdArg)].join(" ");
-  return ["cmd.exe", ["/d", "/c", line]];
-}
-
-function isWindowsShellScript(command: string): boolean {
-  const ext = path.extname(command).toLowerCase();
-  return ext === ".cmd" || ext === ".bat";
-}
-
-function quoteCmdArg(arg: string): string {
-  return `"${arg.replace(/"/g, '\\"')}"`;
 }
 
 function nonEmpty(value: unknown): string | undefined {

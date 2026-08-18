@@ -37,6 +37,12 @@
   "activationEvents": [
     "onStartupFinished"
   ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "The extension reads and writes Claude Code OAuth credentials and runs the Claude CLI, so it stays disabled until a workspace is trusted."
+    }
+  },
   "contributes": {
     "viewsContainers": {
       "activitybar": [
@@ -183,7 +189,7 @@
         "claudeSwitcher.credentialsPath": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Path to the Claude Code `.credentials.json` file. Empty = default `~/.claude/.credentials.json`."
+          "markdownDescription": "Path to the Claude Code `.credentials.json` file. Empty = default `~/.claude/.credentials.json`. A value coming from workspace settings is only honoured when it points inside this extension's own storage, so opening a repository cannot redirect where your tokens are read from or written to."
         },
         "claudeSwitcher.warnThresholdPercent": {
           "type": "number",
@@ -194,21 +200,25 @@
         },
         "claudeSwitcher.claudeCommand": {
           "type": "string",
+          "scope": "machine",
           "default": "claude",
           "markdownDescription": "Claude Code CLI command used for login and Say Hi warmups. Use the full path to `claude.cmd`/`claude.exe` if VS Code cannot find `claude` in PATH."
         },
         "claudeSwitcher.sayHiModel": {
           "type": "string",
+          "scope": "machine",
           "default": "haiku",
           "markdownDescription": "Model passed to `claude -p` for Say Hi warmups. `haiku` is the low-cost/default warmup choice."
         },
         "claudeSwitcher.sayHiPrompt": {
           "type": "string",
+          "scope": "machine",
           "default": "Hi",
           "markdownDescription": "Prompt used by Say Hi warmups."
         },
         "claudeSwitcher.sayHiTimeoutSeconds": {
           "type": "number",
+          "scope": "machine",
           "default": 120,
           "minimum": 15,
           "markdownDescription": "Maximum time to wait for a Say Hi warmup command."

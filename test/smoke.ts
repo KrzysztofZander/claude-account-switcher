@@ -1,6 +1,8 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import * as vscode from "vscode";
+import { buildSpawnArgs } from "../src/cli";
 import { parseUsage, UsagePoller } from "../src/usage";
 import { CredentialsManager } from "../src/credentials";
 import { requiresProfileReauthorization, TokenRefresher } from "../src/oauth";
@@ -711,7 +713,208 @@ async function runTokenRefresherTests(): Promise<void> {
   }
 }
 
+/**
+ * Applies cmd.exe's caret rule to a command line and returns the metacharacters
+ * that survive as live syntax. Anything left here is something a value could use
+ * to run a second command.
+ */
+function stripCmdCarets(line: string): string {
+  let out = "";
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] === "^") {
+      i++;
+      if (i < line.length) out += line[i];
+      continue;
+    }
+    out += line[i];
+  }
+  return out;
+}
+
+function liveCmdMetacharacters(line: string): string[] {
+  const live: string[] = [];
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] === "^") {
+      i++;
+      continue;
+    }
+    if ('&|<>()"'.includes(line[i])) {
+      live.push(line[i]);
+    }
+  }
+  return live;
+}
+
+function runWindowsSpawnQuotingTests(): void {
+  console.log("Windows command quoting:");
+  const realPlatform = process.platform;
+  const setPlatform = (value: string) =>
+    Object.defineProperty(process, "platform", { value, configurable: true });
+
+  try {
+    setPlatform("linux");
+    const direct = buildSpawnArgs("/usr/bin/claude", ["-p", "Hi & calc"]);
+    check(
+      "runs the command directly off Windows, with no shell",
+      direct?.[0] === "/usr/bin/claude" && direct[1][1] === "Hi & calc"
+    );
+
+    setPlatform("win32");
+    const exe = buildSpawnArgs("C:\\tools\\claude.exe", ["-p", "Hi & calc"]);
+    check(
+      "runs a real executable directly on Windows too",
+      exe?.[0] === "C:\\tools\\claude.exe" && exe[1][1] === "Hi & calc"
+    );
+
+    const shim = buildSpawnArgs("C:\\tools\\claude.cmd", [
+      "-p",
+      'Hi" & calc & echo "',
+    ]);
+    check("routes a .cmd shim through cmd.exe", shim?.[0] === "cmd.exe");
+    const line = shim ? shim[1][2] : "";
+    check(
+      "an injected quote cannot end the quoted region",
+      liveCmdMetacharacters(line).length === 0
+    );
+    check(
+      "an injected command separator cannot reach cmd.exe",
+      !liveCmdMetacharacters(line).includes("&")
+    );
+    check(
+      "what cmd.exe hands on still carries the command's own quoting",
+      stripCmdCarets(line).includes('\\"') &&
+        stripCmdCarets(line).startsWith('call "C:\\tools\\claude.cmd"')
+    );
+
+    check(
+      "refuses an argument cmd.exe cannot quote (percent)",
+      buildSpawnArgs("C:\\tools\\claude.cmd", ["-p", "50% off"]) === null
+    );
+    check(
+      "refuses an argument cmd.exe cannot quote (newline)",
+      buildSpawnArgs("C:\\tools\\claude.cmd", ["-p", "a\nb"]) === null
+    );
+    check(
+      "a percent in an argument is refused, not passed to a real executable path",
+      buildSpawnArgs("C:\\tools\\claude.exe", ["-p", "50% off"]) !== null
+    );
+  } finally {
+    Object.defineProperty(process, "platform", {
+      value: realPlatform,
+      configurable: true,
+    });
+  }
+}
+
+function runCredentialsPathScopeTests(): void {
+  console.log("credentialsPath scope:");
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cas-scope-"));
+  const userPath = path.join(tmpDir, "user", ".credentials.json");
+  process.env.TEST_CRED_PATH = userPath;
+
+  const isolatedRoot = path.join(tmpDir, "account-configs");
+  const isolated = path.join(isolatedRoot, "profile-1", ".credentials.json");
+  const hostile = path.join(tmpDir, "checked-out-repo", ".credentials.json");
+  const mgr = new CredentialsManager(isolatedRoot);
+  const setScoped = (vscode as unknown as {
+    __setScopedCredentialsPath: (w?: string, f?: string) => void;
+  }).__setScopedCredentialsPath;
+
+  try {
+    setScoped(undefined, undefined);
+    check("uses the user-level setting when no workspace sets one", mgr.getCredentialsPath() === userPath);
+
+    setScoped(hostile, undefined);
+    check(
+      "ignores a workspace credentialsPath outside the extension's storage",
+      mgr.getCredentialsPath() === userPath
+    );
+
+    setScoped(undefined, hostile);
+    check(
+      "ignores a folder-scoped credentialsPath outside the extension's storage",
+      mgr.getCredentialsPath() === userPath
+    );
+
+    setScoped(path.join(isolatedRoot, "..", "escape", ".credentials.json"), undefined);
+    check(
+      "a workspace value cannot traverse out of the isolated storage root",
+      mgr.getCredentialsPath() === userPath
+    );
+
+    setScoped(isolated, undefined);
+    check(
+      "honours the isolated account config an independent window points at",
+      mgr.getCredentialsPath() === isolated
+    );
+
+    check(
+      "ignores every workspace value when no isolated root is configured",
+      new CredentialsManager().getCredentialsPath() === userPath
+    );
+  } finally {
+    setScoped(undefined, undefined);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+function runCredentialHygieneTests(): void {
+  console.log("Credential file hygiene:");
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cas-hygiene-"));
+  const credPath = path.join(tmpDir, ".credentials.json");
+  process.env.TEST_CRED_PATH = credPath;
+  const mgr = new CredentialsManager();
+  const creds = {
+    accessToken: "AAA",
+    refreshToken: "ra",
+    expiresAt: 111,
+    scopes: ["user:profile"],
+  };
+
+  try {
+    mgr.writeCreds(creds as never);
+    mgr.backupCurrent();
+    check(
+      "the switch backup is not readable by other users",
+      (fs.statSync(credPath + ".bak").mode & 0o077) === 0
+    );
+    mgr.restoreBackup();
+    mgr.discardBackup();
+    check("the switch backup is dropped once its undo is used", !mgr.hasBackup());
+
+    // Each repair login sets another complete token set aside; only the newest
+    // few are worth keeping.
+    for (const stamp of ["20260101000001", "20260101000002", "20260101000003"]) {
+      fs.writeFileSync(`${credPath}.reauth-backup-${stamp}`, "{}", { mode: 0o600 });
+    }
+    mgr.writeCreds(creds as never);
+    const newest = mgr.moveCredentialsAside(undefined, "reauth-backup");
+    const remaining = fs
+      .readdirSync(tmpDir)
+      .filter((name) => name.includes(".reauth-backup-"));
+    check("old set-aside credential files are pruned", remaining.length === 2);
+    check(
+      "pruning keeps the newest, not the oldest",
+      remaining.includes(path.basename(newest as string)) &&
+        !remaining.some((name) => name.endsWith("20260101000001"))
+    );
+    check(
+      "a set-aside credential file is not readable by other users",
+      (fs.statSync(newest as string).mode & 0o077) === 0
+    );
+
+    mgr.writeCreds(creds as never);
+    mgr.removeCredentials();
+    check("an isolated credential copy can be removed", mgr.readCurrent() === null);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
 runProfileActivityTests();
+runWindowsSpawnQuotingTests();
+runCredentialsPathScopeTests();
+runCredentialHygieneTests();
 runBrowserOAuthTests();
 runAccountStoreTests()
   .then(runUsagePollerTests)

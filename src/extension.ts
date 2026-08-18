@@ -14,7 +14,7 @@ import {
   shouldPreferCredentialCandidate,
 } from "./credentialValidation";
 import { CredentialsManager } from "./credentials";
-import { getAccountConfigDir } from "./isolatedConfig";
+import { getAccountConfigDir, getAccountConfigRoot } from "./isolatedConfig";
 import { TokenRefresher } from "./oauth";
 import { ProfileActivityRegistry } from "./profileActivity";
 import { SwitchService } from "./switchService";
@@ -26,7 +26,7 @@ import { WarmupService } from "./warmup";
 
 export function activate(context: vscode.ExtensionContext): void {
   const store = new AccountStore(context);
-  const credentials = new CredentialsManager();
+  const credentials = new CredentialsManager(getAccountConfigRoot(context));
   const refresher = new TokenRefresher();
   const browserOAuth = new BrowserOAuthLogin();
   const profileActivity = new ProfileActivityRegistry(context);
