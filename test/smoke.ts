@@ -462,12 +462,6 @@ async function runUsagePollerTests(): Promise<void> {
   await runStaleActiveProfileTests();
 }
 
-/**
- * Claude Code rotates both tokens when it refreshes, so the generation saved for
- * the active profile stops matching the credentials file and can no longer be
- * synced back. The poller must still report usage — from the live file, which is
- * that account's current login — and must never try to refresh it.
- */
 async function runStaleActiveProfileTests(): Promise<void> {
   console.log("UsagePoller (active profile with stale stored tokens):");
   const hour = 3_600_000;
@@ -516,7 +510,6 @@ async function runStaleActiveProfileTests(): Promise<void> {
       sessionPercent: 45,
       weeklyPercent: 5,
     });
-    // Claude Code refreshed since then, rotating both tokens in the live file.
     credentials.writeCreds({
       accessToken: "live-access",
       refreshToken: "live-refresh",
@@ -532,7 +525,7 @@ async function runStaleActiveProfileTests(): Promise<void> {
       () => 240,
       () => undefined,
       {
-        // The identity lookup is unavailable, so the sync cannot re-adopt the file.
+        // No identity available, so the sync cannot re-adopt the file.
         syncCurrentProfile: async () => {
           await store.syncActiveFromFile(credentials.readCurrent());
         },
@@ -549,8 +542,6 @@ async function runStaleActiveProfileTests(): Promise<void> {
     check("reports no error once the live login worked", usage?.error === undefined);
     check("only one usage request was needed", usageCalls === 1);
 
-    // With no readable live login there is nothing to poll with, but the profile
-    // must still say so rather than sit on numbers that stopped moving.
     const blindStore = createStore();
     const blindProfile = await blindStore.addFromCreds("No file", {
       accessToken: "stale-access",
@@ -576,6 +567,7 @@ async function runStaleActiveProfileTests(): Promise<void> {
     const blindUsage = blindStore.get(blindProfile.id)?.lastUsage;
     check("an unpollable active profile records an error", Boolean(blindUsage?.error));
     check("keeps the last known percentages alongside the error", blindUsage?.sessionPercent === 45);
+
   } finally {
     globalThis.fetch = originalFetch;
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -713,11 +705,6 @@ async function runTokenRefresherTests(): Promise<void> {
   }
 }
 
-/**
- * Applies cmd.exe's caret rule to a command line and returns the metacharacters
- * that survive as live syntax. Anything left here is something a value could use
- * to run a second command.
- */
 function stripCmdCarets(line: string): string {
   let out = "";
   for (let i = 0; i < line.length; i++) {
@@ -882,8 +869,6 @@ function runCredentialHygieneTests(): void {
     mgr.discardBackup();
     check("the switch backup is dropped once its undo is used", !mgr.hasBackup());
 
-    // Each repair login sets another complete token set aside; only the newest
-    // few are worth keeping.
     for (const stamp of ["20260101000001", "20260101000002", "20260101000003"]) {
       fs.writeFileSync(`${credPath}.reauth-backup-${stamp}`, "{}", { mode: 0o600 });
     }

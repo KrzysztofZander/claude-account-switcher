@@ -35,20 +35,9 @@ export function missingClaudeCliMessage(): string {
 }
 
 /**
- * Builds the `spawn` arguments for the Claude CLI.
- *
- * On Windows a `.cmd`/`.bat` shim cannot be executed directly, so it has to go
- * through `cmd.exe /c` — and that puts two parsers in series: cmd.exe reads the
- * line first, then the command applies the C runtime's argv rules. Quoting only
- * for the second parser is what makes this dangerous: cmd.exe does not honour
- * `\"`, so a quote inside a value ends the quoted region and any `&` or `|`
- * after it is run by cmd as a separate command.
- *
- * Returns null when an argument contains something cmd.exe cannot be made to
- * treat as data (newlines, or `%` which is expanded before any escaping
- * applies). Callers report that instead of running a command they cannot
- * predict. On every other platform the command is executed directly, with no
- * shell involved, so no escaping is needed.
+ * Builds the `spawn` arguments for the Claude CLI. A Windows `.cmd`/`.bat` shim
+ * goes through `cmd.exe /c`, which parses the line before the command's own argv
+ * parser does; returns null when an argument cannot be quoted for both.
  */
 export function buildSpawnArgs(
   command: string,
@@ -83,20 +72,14 @@ function isWindowsShellScript(command: string): boolean {
 }
 
 function quoteCmdArg(arg: string): string | null {
-  // `%` is expanded by cmd.exe before any escaping is considered, and a newline
-  // ends the command line outright. Neither can be neutralized here.
+  // cmd.exe expands `%` before any escaping applies, and a newline ends the line.
   if (/[%\r\n]/.test(arg)) {
     return null;
   }
 
-  // Layer 1 — the C runtime's argv rules: escape quotes and double any run of
-  // backslashes that precedes one (or ends the value, where the closing quote
-  // would otherwise consume them).
+  // Escape for the command's argv parser, then caret-escape for cmd.exe itself:
+  // cmd does not honour `\"`, so a quote would otherwise end the quoted region.
   const escaped = arg.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, "$1$1");
-
-  // Layer 2 — cmd.exe's own parser. Caret-escape every metacharacter, the
-  // surrounding quotes included, so cmd passes the whole token through as data
-  // and only the command itself interprets the quoting above.
   return `"${escaped}"`.replace(/[()<>&|^"]/g, "^$&");
 }
 

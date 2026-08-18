@@ -9,7 +9,6 @@ import {
 } from "./credentialValidation";
 import { CredentialsFile, OAuthCreds } from "./types";
 
-/** How many `.reauth-backup-*` files to keep per credentials file. */
 const KEPT_SET_ASIDE_CREDENTIALS = 2;
 
 /**
@@ -17,11 +16,6 @@ const KEPT_SET_ASIDE_CREDENTIALS = 2;
  * Switching accounts = swapping the contents of this file.
  */
 export class CredentialsManager {
-  /**
-   * @param isolatedConfigRoot Directory holding this extension's own per-profile
-   * Claude configs. It is the only location a workspace-scoped `credentialsPath`
-   * may point at — see `configuredCredentialsPath`.
-   */
   constructor(private readonly isolatedConfigRoot?: string) {}
 
   getCredentialsPath(configDir?: string): string {
@@ -36,14 +30,7 @@ export class CredentialsManager {
     return path.join(os.homedir(), ".claude", ".credentials.json");
   }
 
-  /**
-   * Resolves the `credentialsPath` setting, honouring a workspace-scoped value
-   * only when it points inside this extension's own isolated config storage —
-   * which is where the extension itself writes one, for independent account
-   * windows. Any other workspace value is ignored: this path is both read from
-   * and written to on a switch, so accepting it from a repository would let that
-   * repository choose where your OAuth tokens land.
-   */
+  /** Resolves `credentialsPath`; a workspace value is honoured only for isolated configs. */
   private configuredCredentialsPath(): string {
     const cfg = vscode.workspace.getConfiguration("claudeSwitcher");
     const inspected = cfg.inspect
@@ -156,10 +143,6 @@ export class CredentialsManager {
     return true;
   }
 
-  /**
-   * Deletes a credentials file. Used to drop the plaintext copy written into a
-   * profile's isolated config once its tokens are back in SecretStorage.
-   */
   removeCredentials(configDir?: string): void {
     try {
       fs.rmSync(this.getCredentialsPath(configDir), { force: true });
@@ -172,17 +155,13 @@ export class CredentialsManager {
     return this.getCredentialsPath() + ".bak";
   }
 
-  /**
-   * Copies the current file to .bak (enables undoing a switch). The copy holds a
-   * full working token set for whichever account is being switched away from, so
-   * it is re-secured explicitly: copyFileSync keeps the *destination's* mode when
-   * the backup already exists, which would leave an earlier, laxer mode in place.
-   */
+  /** Copies the current file to .bak (enables undoing a switch). */
   backupCurrent(): boolean {
     const p = this.getCredentialsPath();
     try {
       if (fs.existsSync(p)) {
         fs.copyFileSync(p, this.backupPath());
+        // copyFileSync keeps the destination's mode when .bak already exists.
         try {
           fs.chmodSync(this.backupPath(), 0o600);
         } catch {
@@ -196,7 +175,6 @@ export class CredentialsManager {
     return false;
   }
 
-  /** Removes the switch backup once it has served its purpose. */
   discardBackup(): void {
     try {
       fs.rmSync(this.backupPath(), { force: true });
@@ -251,11 +229,6 @@ export class CredentialsManager {
     }
   }
 
-  /**
-   * Keeps only the newest few set-aside credential files. Every one of them is a
-   * complete, plaintext token set, and one is written per repair login — left
-   * alone they pile up indefinitely for no added recovery value.
-   */
   private pruneSetAsideCredentials(credentialsPath: string, reason: string): void {
     const dir = path.dirname(credentialsPath);
     const prefix = path.basename(credentialsPath) + `.${reason}-`;
@@ -269,7 +242,7 @@ export class CredentialsManager {
         fs.rmSync(path.join(dir, name), { force: true });
       }
     } catch {
-      /* pruning is best-effort; it must never fail the reauthorization */
+      /* best-effort; must never fail the reauthorization */
     }
   }
 }

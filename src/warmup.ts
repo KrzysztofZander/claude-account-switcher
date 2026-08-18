@@ -127,10 +127,7 @@ export class WarmupService {
       if (updatedCreds) {
         await this.store.updateCreds(id, updatedCreds);
       }
-      // The warmup process has exited and any rotation it performed is now in
-      // SecretStorage, so the plaintext copy this run wrote has no reader left.
-      // A profile held by a live account window never reaches here — Say Hi
-      // refuses to run against an active profile.
+      // Say Hi refuses to run against an active profile, so nothing else reads this.
       this.credentials.removeCredentials(configDir);
 
       if (result.timedOut) {

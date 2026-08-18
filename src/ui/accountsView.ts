@@ -190,7 +190,5 @@ function displayUsageError(
 }
 
 function getNonce(): string {
-  // A CSP nonce is only as good as its unpredictability; Math.random is not a
-  // cryptographic source and its state can be inferred from earlier outputs.
   return crypto.randomBytes(24).toString("base64");
 }

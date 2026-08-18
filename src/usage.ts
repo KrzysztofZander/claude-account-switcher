@@ -113,11 +113,7 @@ export interface UsagePollerCoordination {
   syncCurrentProfile?: () => Promise<void>;
   /** True while Claude Code owns this profile in any live VS Code window. */
   isProfileActive?: (id: string) => boolean;
-  /**
-   * Reads the credentials file Claude Code is using right now. For the active
-   * profile this is that account's current login, so it is the only generation
-   * guaranteed not to have been rotated out from under the stored copy.
-   */
+  /** Reads the credentials file Claude Code is using in this window. */
   readActiveFileCreds?: () => OAuthCreds | null;
   /** Propagates a successful rotation to local credential replicas using compare-and-swap. */
   persistRefreshedCreds?: (
@@ -191,9 +187,7 @@ export class UsagePoller {
   }
 
   async pollAll(force: boolean): Promise<void> {
-    // First sync the active profile from the file (fresh tokens). A sync that
-    // throws must not abort the poll: the accounts it did not reach would stop
-    // updating with no error against any of them.
+    // First sync the active profile from the file (fresh tokens).
     try {
       if (this.coordination.syncCurrentProfile) {
         await this.coordination.syncCurrentProfile();
@@ -201,7 +195,7 @@ export class UsagePoller {
         await this.store.syncActiveFromFile(this.credentials.readCurrent());
       }
     } catch {
-      /* Each profile still polls below and records its own failure. */
+      /* each profile still polls below and records its own failure */
     }
 
     const profiles = this.store.list();
@@ -249,8 +243,6 @@ export class UsagePoller {
       prev = this.store.get(id)?.lastUsage;
     }
     if (requiresProfileReauthorization(prev?.error)) {
-      // Already reported as "needs reauthorization"; retrying would only spend a
-      // refresh token that the server has already rejected.
       return;
     }
 
@@ -307,12 +299,7 @@ export class UsagePoller {
     }
   }
 
-  /**
-   * Writes a failed poll to the profile so the panel can explain itself. Every
-   * unsuccessful path must land here: a poll that returns without touching
-   * `lastUsage` leaves the last good snapshot on screen forever, with nothing
-   * anywhere to say that the numbers stopped moving.
-   */
+  /** Records a failed poll. Every unsuccessful path must land here. */
   private async recordFailure(
     id: string,
     prev: UsageSnapshot | undefined,
@@ -329,11 +316,6 @@ export class UsagePoller {
     });
   }
 
-  /**
-   * Picks the first credential generation that can still be used for a read,
-   * skipping any that is incomplete, expired, or identical to one the server
-   * has already rejected in this poll.
-   */
   private firstUsable(
     candidates: (OAuthCreds | null | undefined)[],
     rejected?: OAuthCreds
@@ -353,11 +335,7 @@ export class UsagePoller {
     return null;
   }
 
-  /**
-   * The live Claude Code login. For an active profile this is that account's
-   * current generation, and reading it spends nothing — unlike a token refresh,
-   * which would race Claude Code for a single-use refresh token.
-   */
+  /** The live Claude Code login. Reading it spends no refresh token. */
   private activeFileCreds(): OAuthCreds | null {
     try {
       return this.coordination.readActiveFileCreds?.() ?? null;
