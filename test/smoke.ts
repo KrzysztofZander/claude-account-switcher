@@ -568,6 +568,45 @@ async function runStaleActiveProfileTests(): Promise<void> {
     check("an unpollable active profile records an error", Boolean(blindUsage?.error));
     check("keeps the last known percentages alongside the error", blindUsage?.sessionPercent === 45);
 
+    // A profile can be active in another window, whose credentials file is not
+    // this window's. Reading ours would report the wrong account's usage.
+    const otherStore = createStore();
+    const otherProfile = await otherStore.addFromCreds("Open elsewhere", {
+      accessToken: "stale-access",
+      refreshToken: "stale-refresh",
+      expiresAt: Date.now() - 9 * hour,
+      scopes: ["user:profile"],
+    });
+    // This window is on a different profile; "Open elsewhere" is active only
+    // through another window's lease.
+    const thisWindowProfile = await otherStore.addFromCreds("This window", {
+      accessToken: "live-access",
+      refreshToken: "live-refresh",
+      expiresAt: Date.now() + 7 * hour,
+      scopes: ["user:profile"],
+    });
+    await otherStore.setActiveId(thisWindowProfile.id);
+    const usageCallsBefore = usageCalls;
+    const otherPoller = new UsagePoller(
+      otherStore,
+      new TokenRefresher(),
+      credentials,
+      () => 240,
+      () => undefined,
+      {
+        isProfileActive: () => true,
+        readActiveFileCreds: () => credentials.readCurrent(),
+      }
+    );
+    await otherPoller.pollOne(otherProfile.id, true);
+    check(
+      "never polls another window's profile with this window's credentials",
+      usageCalls === usageCallsBefore
+    );
+    check(
+      "reports why instead of attributing the wrong account's usage",
+      Boolean(otherStore.get(otherProfile.id)?.lastUsage?.error)
+    );
   } finally {
     globalThis.fetch = originalFetch;
     fs.rmSync(tmpDir, { recursive: true, force: true });

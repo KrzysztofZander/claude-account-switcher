@@ -250,7 +250,7 @@ export class UsagePoller {
     if (TokenRefresher.isExpired(creds) && this.isProfileActive(id)) {
       await this.syncActiveProfile();
       const synced = await this.store.getCreds(id);
-      const usable = this.firstUsable([synced, this.activeFileCreds()]);
+      const usable = this.firstUsable([synced, this.activeFileCreds(id)]);
       if (!usable) {
         await this.recordFailure(id, prev, STALE_ACTIVE_PROFILE_ERROR);
         return;
@@ -271,7 +271,7 @@ export class UsagePoller {
       if (this.isProfileActive(id)) {
         await this.syncActiveProfile();
         const synced = await this.store.getCreds(id);
-        const retry = this.firstUsable([synced, this.activeFileCreds()], creds);
+        const retry = this.firstUsable([synced, this.activeFileCreds(id)], creds);
         if (!retry) {
           await this.recordFailure(id, prev, STALE_ACTIVE_PROFILE_ERROR);
           return;
@@ -336,7 +336,11 @@ export class UsagePoller {
   }
 
   /** The live Claude Code login. Reading it spends no refresh token. */
-  private activeFileCreds(): OAuthCreds | null {
+  private activeFileCreds(id: string): OAuthCreds | null {
+    // isProfileActive also covers other windows, whose file this is not.
+    if (this.store.getActiveId() !== id) {
+      return null;
+    }
     try {
       return this.coordination.readActiveFileCreds?.() ?? null;
     } catch {
