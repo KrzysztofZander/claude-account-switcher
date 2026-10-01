@@ -62,7 +62,7 @@ export class AccountsViewProvider implements vscode.WebviewViewProvider {
           void vscode.commands.executeCommand("claudeSwitcher.addCurrentAccount");
           break;
         case "login":
-          void vscode.commands.executeCommand("claudeSwitcher.login");
+          void vscode.commands.executeCommand("claudeSwitcher.addAccount");
           break;
         case "reauthorize":
           if (msg.id) {
@@ -99,7 +99,10 @@ export class AccountsViewProvider implements vscode.WebviewViewProvider {
       profiles.map(async (p): Promise<ViewAccount> => {
         const creds = await this.store.getCreds(p.id);
         const error = p.lastUsage?.error;
-        const needsReauthorization = !hasUsableOAuthCreds(creds) || isAuthProblem(error);
+        const needsReauthorization =
+          !hasUsableOAuthCreds(creds) ||
+          this.store.isRefreshTokenDead(p.id, creds?.refreshToken) ||
+          requiresProfileReauthorization(error);
         return {
           id: p.id,
           label: p.label,
@@ -143,15 +146,16 @@ export class AccountsViewProvider implements vscode.WebviewViewProvider {
 </head>
 <body>
   <div id="toolbar">
-    <button id="addBtn" class="primary">+ Save current account</button>
-    <button id="loginBtn" title="Open Claude login">Login</button>
+    <button id="addBtn" class="primary" title="Save the account Claude Code is logged in with">Save current</button>
+    <button id="loginBtn" title="Log in to another Claude account in an isolated login (the current account is not touched)">+ Add account</button>
     <button id="sayHiBtn" title="Say Hi on inactive accounts">Hi</button>
     <button id="refreshBtn" title="Refresh usage limits">⟳</button>
   </div>
   <div id="list"></div>
   <div id="empty" class="hidden">
     <p>No saved accounts.</p>
-    <p>Log in to Claude Code, then click <b>"Save current account"</b>.</p>
+    <p>Click <b>"Save current"</b> to save the account Claude Code is logged in with, or <b>"+ Add account"</b> to log in to another one.</p>
+    <p>Never use <code>/logout</code> to change accounts: it revokes that login on Anthropic's side.</p>
   </div>
   <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
@@ -159,31 +163,12 @@ export class AccountsViewProvider implements vscode.WebviewViewProvider {
   }
 }
 
-function isAuthProblem(error: string | undefined): boolean {
-  if (requiresProfileReauthorization(error)) {
-    return true;
-  }
-
-  const text = error?.toLowerCase() ?? "";
-  return (
-    text.includes("failed to refresh token") ||
-    text.includes("refresh token") ||
-    text.includes("reauthoriz") ||
-    text.includes("unauthorized") ||
-    text.includes("forbidden") ||
-    text.includes("invalid_request_error") ||
-    text.includes("invalid_grant") ||
-    text.includes("http 401") ||
-    text.includes("http 403")
-  );
-}
-
 function displayUsageError(
   error: string | undefined,
   needsReauthorization: boolean
 ): string | undefined {
   if (needsReauthorization) {
-    return "Needs reauthorization. Use Auth to refresh this profile.";
+    return "Login was revoked or expired. Use Auth to reauthorize this profile.";
   }
   return error;
 }

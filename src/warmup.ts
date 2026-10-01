@@ -1,5 +1,4 @@
 import { spawn } from "child_process";
-import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 import { AccountStore } from "./accountStore";
@@ -8,10 +7,9 @@ import {
   missingClaudeCliMessage,
   resolveClaudeCommand,
 } from "./cli";
+import { CredentialSync } from "./credentialSync";
 import { hasUsableOAuthCreds } from "./credentialValidation";
-import { CredentialsManager } from "./credentials";
 import { getAccountConfigDir } from "./isolatedConfig";
-import { withFileLock } from "./lock";
 import { ProfileActivityRegistry } from "./profileActivity";
 
 export interface WarmupResult {
@@ -31,7 +29,7 @@ export class WarmupService {
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly store: AccountStore,
-    private readonly credentials: CredentialsManager,
+    private readonly sync: CredentialSync,
     private readonly profileActivity?: ProfileActivityRegistry
   ) {}
 
@@ -45,11 +43,11 @@ export class WarmupService {
       return { ok: false, message: "Profile not found." };
     }
 
-    const currentFileProfileId = await this.findCurrentFileProfileId();
+    const current = await this.sync.syncCurrent();
     if (
       this.store.getActiveId() === id ||
-      currentFileProfileId === id ||
-      this.profileActivity?.isActive(id) === true
+      current.ownerId === id ||
+      this.profileActivity?.isActive(id, { excludeSelf: true }) === true
     ) {
       return {
         ok: false,
@@ -70,96 +68,71 @@ export class WarmupService {
       };
     }
 
-    const locked = await withFileLock(`refresh:${id}`, 30_000, async () => {
-      if (this.profileActivity?.isActive(id) === true) {
-        return {
-          ok: false,
-          message: `"${profile.label}" became active in another window. Say Hi was skipped.`,
-        };
-      }
-      this.profileActivity?.markPending(id);
-      const latestCreds = (await this.store.getCreds(id)) ?? creds;
-      if (!hasUsableOAuthCreds(latestCreds)) {
-        return {
-          ok: false,
-          message:
-            `"${profile.label}" needs reauthorization. Use "Claude: Reauthorize account profile" for this profile first.`,
-        };
-      }
-      const configDir = this.getProfileConfigDir(id);
-      fs.mkdirSync(configDir, { recursive: true });
-      this.credentials.writeCreds(latestCreds, configDir);
-
-      const configuredCommand = getConfiguredClaudeCommand();
-      const command = resolveClaudeCommand(configuredCommand);
-      if (!command) {
-        return {
-          ok: false,
-          message: `"${profile.label}" Say Hi failed: ${missingClaudeCliMessage()}`,
-        };
-      }
-
-      const cfg = vscode.workspace.getConfiguration("claudeSwitcher");
-      const model = cfg.get<string>("sayHiModel", "haiku").trim() || "haiku";
-      const prompt = cfg.get<string>("sayHiPrompt", "Hi").trim() || "Hi";
-      const timeoutMs = Math.max(15, cfg.get<number>("sayHiTimeoutSeconds", 120)) * 1000;
-
-      const result = await runClaude(
-        command,
-        [
-          "-p",
-          prompt,
-          "--model",
-          model,
-          "--max-turns",
-          "1",
-          "--no-session-persistence",
-          "--disallowedTools",
-          "*",
-        ],
-        { CLAUDE_CONFIG_DIR: configDir },
-        vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd(),
-        timeoutMs
-      );
-
-      const updatedCreds = this.credentials.readCurrent(configDir);
-      if (updatedCreds) {
-        await this.store.updateCreds(id, updatedCreds);
-      }
-
-      if (result.timedOut) {
-        return {
-          ok: false,
-          message: `"${profile.label}" Say Hi timed out after ${Math.round(timeoutMs / 1000)}s.`,
-        };
-      }
-
-      if (result.code !== 0) {
-        const details = (result.stderr || result.stdout).trim().slice(0, 300);
-        return {
-          ok: false,
-          message:
-            `"${profile.label}" Say Hi failed` +
-            (details ? `: ${details}` : ` with exit code ${result.code ?? "unknown"}.`),
-        };
-      }
-
-      return { ok: true, message: `Say Hi completed for "${profile.label}".` };
-    });
-
-    if (!locked.acquired) {
+    // Write the newest generation into the isolated dir, then let Claude Code own
+    // the login while it runs: it refreshes under its lock in that same directory.
+    this.profileActivity?.markPending(id);
+    const prepared = await this.sync.prepareHomeDir(id);
+    if (!prepared.ok) {
       return {
         ok: false,
-        message: `Token refresh or Say Hi is already running for "${profile.label}" in another window.`,
+        message: prepared.deferred
+          ? `Token refresh is already running for "${profile.label}". Try again in a few seconds.`
+          : `"${profile.label}" needs reauthorization. Use "Claude: Reauthorize account profile" for this profile first.`,
       };
     }
 
-    return locked.value ?? { ok: false, message: `Say Hi failed for "${profile.label}".` };
-  }
+    const configuredCommand = getConfiguredClaudeCommand();
+    const command = resolveClaudeCommand(configuredCommand);
+    if (!command) {
+      return {
+        ok: false,
+        message: `"${profile.label}" Say Hi failed: ${missingClaudeCliMessage()}`,
+      };
+    }
 
-  private async findCurrentFileProfileId(): Promise<string | undefined> {
-    const current = this.credentials.readCurrent();
-    return current ? this.store.findByTokens(current) : undefined;
+    const cfg = vscode.workspace.getConfiguration("claudeSwitcher");
+    const model = cfg.get<string>("sayHiModel", "haiku").trim() || "haiku";
+    const prompt = cfg.get<string>("sayHiPrompt", "Hi").trim() || "Hi";
+    const timeoutMs = Math.max(15, cfg.get<number>("sayHiTimeoutSeconds", 120)) * 1000;
+
+    const result = await runClaude(
+      command,
+      [
+        "-p",
+        prompt,
+        "--model",
+        model,
+        "--max-turns",
+        "1",
+        "--no-session-persistence",
+        "--disallowedTools",
+        "*",
+      ],
+      { CLAUDE_CONFIG_DIR: this.getProfileConfigDir(id) },
+      vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd(),
+      timeoutMs
+    );
+
+    await this.sync.importHomeDir(id);
+
+    if (result.timedOut) {
+      return {
+        ok: false,
+        message: `"${profile.label}" Say Hi timed out after ${Math.round(timeoutMs / 1000)}s.`,
+      };
+    }
+
+    if (result.code !== 0) {
+      const details = (result.stderr || result.stdout).trim().slice(0, 300);
+      return {
+        ok: false,
+        message:
+          `"${profile.label}" Say Hi failed` +
+          (details ? `: ${details}` : ` with exit code ${result.code ?? "unknown"}.`),
+      };
+    }
+
+    return { ok: true, message: `Say Hi completed for "${profile.label}".` };
   }
 }
 

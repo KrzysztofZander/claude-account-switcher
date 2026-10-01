@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.3.0
+
+Fixes saved accounts and Claude Code itself repeatedly needing reauthorization.
+
+- Token refreshes now take Claude Code's own refresh locks (`<configDir>/.oauth_refresh.lock`
+  and the legacy `<configDir>.lock`) instead of a private lock in the temp directory, so Claude
+  Code waits for the extension and adopts its rotation instead of spending the same single-use
+  refresh token.
+- Every rotation is written back (compare-and-swap) to all local credential files holding the
+  login, and the newest generation across the vault, `~/.claude` and isolated config dirs is
+  always used.
+- Switching first saves the outgoing account's latest rotation under the lock. Previously a
+  rotation made by Claude Code after the last poll was lost on switch, leaving the profile with a
+  spent token.
+- Undo restores the newest token generation of the previous profile instead of the raw `.bak`
+  copy, which could contain an already rotated refresh token.
+- Accounts are identified by Claude account id via `/api/oauth/profile` (no CLI needed), so a
+  fully rotated login is still recognized. Team members sharing one organization and one person
+  in several organizations are no longer confused with each other.
+- Watches `.credentials.json` and imports Claude Code's rotations immediately.
+- Switching also replaces `organizationUuid` in `.credentials.json` and `oauthAccount` in
+  `.claude.json`, which previously kept the previous account's values.
+- A refresh token rejected with `invalid_grant` is never sent again; the profile recovers on its
+  own once any copy holds a newer login. Network errors no longer show "Needs reauthorization".
+- New **+ Add account** flow logs in to another account in an isolated config dir without
+  touching the current one; isolated logins and reauthorizations complete automatically.
+  The panel's toolbar buttons are now "Save current" and "+ Add account".
+- When Claude Code is logged in to an account that is not saved, the status bar shows it and the
+  extension offers to save it.
+- Browser authorization and default refresh scopes include `user:plugins`, matching current
+  Claude Code.
+- Documented that `/logout` revokes the login on Anthropic's side and must not be used to change
+  accounts.
+
 ## 0.2.5
 
 - Added browser-based OAuth authorization that works without Claude Code CLI.

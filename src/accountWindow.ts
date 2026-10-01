@@ -3,10 +3,8 @@ import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 import { AccountStore } from "./accountStore";
-import {
-  hasUsableOAuthCreds,
-  shouldPreferCredentialCandidate,
-} from "./credentialValidation";
+import { CredentialSync } from "./credentialSync";
+import { hasUsableOAuthCreds } from "./credentialValidation";
 import { CredentialsManager } from "./credentials";
 import { getAccountConfigDir } from "./isolatedConfig";
 import { ProfileActivityRegistry } from "./profileActivity";
@@ -26,6 +24,7 @@ export class AccountWindowService {
     private readonly context: vscode.ExtensionContext,
     private readonly store: AccountStore,
     private readonly credentials: CredentialsManager,
+    private readonly sync: CredentialSync,
     private readonly profileActivity?: ProfileActivityRegistry
   ) {}
 
@@ -43,7 +42,7 @@ export class AccountWindowService {
       };
     }
 
-    let creds = await this.store.getCreds(id);
+    const creds = await this.store.getCreds(id);
     if (!creds) {
       return { ok: false, message: `No stored credentials for "${profile.label}".` };
     }
@@ -54,7 +53,7 @@ export class AccountWindowService {
           `"${profile.label}" needs reauthorization. Use "Claude: Reauthorize account profile" for this profile first.`,
       };
     }
-    if (this.profileActivity?.isActive(id)) {
+    if (this.profileActivity?.isActive(id, { excludeSelf: true })) {
       return {
         ok: false,
         message:
@@ -63,15 +62,26 @@ export class AccountWindowService {
       };
     }
 
+    const current = await this.sync.syncCurrent();
+    if (current.ownerId === id) {
+      return {
+        ok: false,
+        message:
+          `"${profile.label}" is the account of this window's Claude Code. ` +
+          "Switch this window to another account first, so two sessions do not share one refresh token.",
+      };
+    }
+
     this.profileActivity?.markPending(id);
     const configDir = getAccountConfigDir(this.context, id);
-    fs.mkdirSync(configDir, { recursive: true });
-    const fileCreds = this.credentials.readCurrent(configDir);
-    if (fileCreds && shouldPreferCredentialCandidate(fileCreds, creds)) {
-      creds = fileCreds;
-      await this.store.updateCreds(id, fileCreds);
-    } else {
-      this.credentials.writeCreds(creds, configDir);
+    const prepared = await this.sync.prepareHomeDir(id);
+    if (!prepared.ok) {
+      return {
+        ok: false,
+        message: prepared.deferred
+          ? `Token refresh is already running for "${profile.label}". Try again in a few seconds.`
+          : `"${profile.label}" needs reauthorization. Use "Claude: Reauthorize account profile" first.`,
+      };
     }
 
     const workspacePath = this.getWorkspacePath(id, workspaceFolders);

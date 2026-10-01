@@ -4,6 +4,8 @@ import {
   sameNonEmptyToken,
   shouldPreferCredentialCandidate,
 } from "./credentialValidation";
+import { hasIdentity, profileMatchesIdentity } from "./identity";
+import { tokenFingerprint } from "./oauth";
 import { AccountProfile, ClaudeAuthIdentity, OAuthCreds, UsageSnapshot } from "./types";
 
 const PROFILES_KEY = "claudeSwitcher.profiles";
@@ -17,8 +19,8 @@ const SECRET_PREFIX = "claudeSwitcher.account.";
  * accounts without racing through one global marker.
  *
  * The "active" account is the one whose tokens are currently in .credentials.json.
- * Because Claude Code rotates tokens, the source of truth is the remembered
- * `activeId`, and we sync the active profile's creds from the file (syncActiveFromFile).
+ * Claude Code rotates those tokens, so CredentialSync keeps the vault copy in step
+ * with every credentials file that holds the same login.
  */
 export class AccountStore {
   constructor(private readonly context: vscode.ExtensionContext) {}
@@ -67,21 +69,35 @@ export class AccountStore {
     await this.context.secrets.store(this.secretKey(id), JSON.stringify(creds));
   }
 
-  /** Creates a new profile from the given creds and marks it active. */
-  async addFromCreds(label: string, creds: OAuthCreds): Promise<AccountProfile> {
+  /**
+   * Creates a new profile from the given creds. By default it is marked active
+   * (it came from the current credentials file); isolated logins pass
+   * `activate: false` and their pre-allocated id so their config dir matches.
+   */
+  async addFromCreds(
+    label: string,
+    creds: OAuthCreds,
+    options: { id?: string; identity?: ClaudeAuthIdentity; activate?: boolean } = {}
+  ): Promise<AccountProfile> {
     const profiles = this.profiles;
     const maxOrder = profiles.reduce((m, p) => Math.max(m, p.order), -1);
     const profile: AccountProfile = {
-      id: crypto.randomUUID(),
+      id: options.id ?? crypto.randomUUID(),
       label,
       subscriptionType: creds.subscriptionType,
+      authAccountUuid: options.identity?.accountUuid,
+      authEmail: options.identity?.email,
+      authOrgId: options.identity?.orgId,
+      authOrgName: options.identity?.orgName,
       addedAt: Date.now(),
       order: maxOrder + 1,
     };
     profiles.push(profile);
     await this.saveProfiles(profiles);
     await this.setCreds(profile.id, creds);
-    await this.setActiveId(profile.id);
+    if (options.activate !== false) {
+      await this.setActiveId(profile.id);
+    }
     return profile;
   }
 
@@ -129,29 +145,57 @@ export class AccountStore {
   async updateIdentity(id: string, identity: ClaudeAuthIdentity): Promise<void> {
     const profiles = this.profiles;
     const p = profiles.find((x) => x.id === id);
-    if (p) {
-      p.authEmail = identity.email;
-      p.authOrgId = identity.orgId;
-      p.authOrgName = identity.orgName;
+    if (!p) {
+      return;
+    }
+    const next = {
+      authAccountUuid: identity.accountUuid ?? p.authAccountUuid,
+      authEmail: identity.email ?? p.authEmail,
+      authOrgId: identity.orgId ?? p.authOrgId,
+      authOrgName: identity.orgName ?? p.authOrgName,
+    };
+    if (
+      next.authAccountUuid !== p.authAccountUuid ||
+      next.authEmail !== p.authEmail ||
+      next.authOrgId !== p.authOrgId ||
+      next.authOrgName !== p.authOrgName
+    ) {
+      Object.assign(p, next);
       await this.saveProfiles(profiles);
     }
   }
 
+  async setOAuthAccount(id: string, account: Record<string, unknown>): Promise<void> {
+    const profiles = this.profiles;
+    const p = profiles.find((x) => x.id === id);
+    if (p && JSON.stringify(p.oauthAccount) !== JSON.stringify(account)) {
+      p.oauthAccount = account;
+      await this.saveProfiles(profiles);
+    }
+  }
+
+  /** Remembers that the server rejected this refresh token (invalid_grant). */
+  async markRefreshTokenDead(id: string, refreshToken: string): Promise<void> {
+    const profiles = this.profiles;
+    const p = profiles.find((x) => x.id === id);
+    if (p && refreshToken) {
+      p.deadRefreshTokenHash = tokenFingerprint(refreshToken);
+      await this.saveProfiles(profiles);
+    }
+  }
+
+  isRefreshTokenDead(id: string, refreshToken: string | undefined): boolean {
+    const hash = this.get(id)?.deadRefreshTokenHash;
+    return Boolean(hash && refreshToken && tokenFingerprint(refreshToken) === hash);
+  }
+
   findByIdentity(identity: ClaudeAuthIdentity, exceptId?: string): AccountProfile | undefined {
-    const email = normalizeEmail(identity.email);
-    const orgId = normalizeIdentityValue(identity.orgId);
-    if (!email && !orgId) {
+    if (!hasIdentity(identity)) {
       return undefined;
     }
-
-    return this.profiles.find((p) => {
-      if (p.id === exceptId) {
-        return false;
-      }
-      const profileOrgId = normalizeIdentityValue(p.authOrgId);
-      const profileEmail = normalizeEmail(p.authEmail);
-      return Boolean((orgId && profileOrgId === orgId) || (email && profileEmail === email));
-    });
+    return this.profiles.find(
+      (p) => p.id !== exceptId && profileMatchesIdentity(p, identity)
+    );
   }
 
   /** Overwrites a profile's tokens (e.g. after a refresh) and updates the subscription type. */
@@ -165,11 +209,16 @@ export class AccountStore {
       p.subscriptionType = creds.subscriptionType;
       changed = true;
     }
-    if (p?.lastUsage && credentialsChanged(previous, creds)) {
-      const next = { ...p.lastUsage };
-      delete next.error;
-      delete next.retryAfter;
-      p.lastUsage = next;
+    if (p && credentialsChanged(previous, creds)) {
+      if (p.lastUsage) {
+        const next = { ...p.lastUsage };
+        delete next.error;
+        delete next.retryAfter;
+        p.lastUsage = next;
+      }
+      if (p.deadRefreshTokenHash && p.deadRefreshTokenHash !== tokenFingerprint(creds.refreshToken)) {
+        delete p.deadRefreshTokenHash;
+      }
       changed = true;
     }
     if (changed) {
@@ -192,83 +241,17 @@ export class AccountStore {
     return undefined;
   }
 
-  /**
-   * Syncs the active profile's creds with the current file. If the file matches
-   * a saved profile, that profile becomes active and receives the freshest tokens.
-   *
-   * If the file does not match any saved profile, we intentionally do not overwrite the
-   * remembered active profile. That case can mean "same account rotated both tokens",
-   * but it can also mean the user manually logged in to another account. Overwriting here
-   * would destroy the stored profile and is a common cause of later login failures.
-   */
-  async syncActiveFromFile(
-    fileCreds: OAuthCreds | null,
-    identity?: ClaudeAuthIdentity
-  ): Promise<void> {
-    if (!fileCreds) {
-      return;
-    }
-    const matched = await this.findByTokens(fileCreds);
-    if (matched) {
-      await this.setActiveId(matched);
-      await this.updateCredsIfNewer(matched, fileCreds);
-      return;
-    }
-
-    const identityMatch = identity ? this.findByIdentity(identity) : undefined;
-    if (identityMatch) {
-      await this.setActiveId(identityMatch.id);
-      await this.updateCredsIfNewer(identityMatch.id, fileCreds);
-      return;
-    }
-    const activeId = this.getActiveId();
-    const activeCreds = activeId ? await this.getCreds(activeId) : null;
-    if (
-      activeId &&
-      this.get(activeId) &&
-      activeCreds &&
-      (sameNonEmptyToken(activeCreds.accessToken, fileCreds.accessToken) ||
-        sameNonEmptyToken(activeCreds.refreshToken, fileCreds.refreshToken))
-    ) {
-      await this.updateCreds(activeId, fileCreds);
-      return;
-    }
-
-    const activeProfile = activeId ? this.get(activeId) : undefined;
-    if (activeId && activeProfile && identity && profileMatchesIdentity(activeProfile, identity)) {
-      await this.updateCredsIfNewer(activeId, fileCreds);
-    }
-  }
-
-  private async updateCredsIfNewer(id: string, candidate: OAuthCreds): Promise<void> {
+  /** Stores `candidate` only when it is a newer token generation than the vault copy. */
+  async updateCredsIfNewer(id: string, candidate: OAuthCreds): Promise<boolean> {
     const stored = await this.getCreds(id);
     if (!stored || shouldPreferCredentialCandidate(candidate, stored)) {
-      await this.updateCreds(id, candidate);
+      if (!stored || credentialsChanged(stored, candidate)) {
+        await this.updateCreds(id, candidate);
+        return true;
+      }
     }
+    return false;
   }
-}
-
-function normalizeEmail(value: string | undefined): string | undefined {
-  return normalizeIdentityValue(value)?.toLowerCase();
-}
-
-function normalizeIdentityValue(value: string | undefined): string | undefined {
-  const trimmed = value?.trim();
-  return trimmed ? trimmed : undefined;
-}
-
-function profileMatchesIdentity(
-  profile: AccountProfile,
-  identity: ClaudeAuthIdentity
-): boolean {
-  const profileOrgId = normalizeIdentityValue(profile.authOrgId);
-  const identityOrgId = normalizeIdentityValue(identity.orgId);
-  if (profileOrgId && identityOrgId) {
-    return profileOrgId === identityOrgId;
-  }
-  const profileEmail = normalizeEmail(profile.authEmail);
-  const identityEmail = normalizeEmail(identity.email);
-  return Boolean(profileEmail && identityEmail && profileEmail === identityEmail);
 }
 
 function credentialsChanged(previous: OAuthCreds | null, next: OAuthCreds): boolean {

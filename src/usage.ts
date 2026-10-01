@@ -1,12 +1,6 @@
 import { AccountStore } from "./accountStore";
-import {
-  hasUsableOAuthCreds,
-  sameNonEmptyToken,
-  shouldPreferCredentialCandidate,
-} from "./credentialValidation";
-import { CredentialsManager } from "./credentials";
-import { withFileLock } from "./lock";
-import { requiresProfileReauthorization, TokenRefresher } from "./oauth";
+import { CredentialSync } from "./credentialSync";
+import { profileIdentity, sameIdentity } from "./identity";
 import { OAuthCreds, UsageSnapshot, UsageWindow } from "./types";
 
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
@@ -103,21 +97,6 @@ export interface FetchResult {
   error?: string;
 }
 
-export interface UsagePollerCoordination {
-  /** Reads the persistent per-profile Claude config, if one exists. */
-  readProfileCreds?: (id: string) => OAuthCreds | null;
-  /** Reconciles the credentials file used by this VS Code window with SecretStorage. */
-  syncCurrentProfile?: () => Promise<void>;
-  /** True while Claude Code owns this profile in any live VS Code window. */
-  isProfileActive?: (id: string) => boolean;
-  /** Propagates a successful rotation to local credential replicas using compare-and-swap. */
-  persistRefreshedCreds?: (
-    id: string,
-    previous: OAuthCreds,
-    next: OAuthCreds
-  ) => void;
-}
-
 /** A single call to the usage endpoint for the given token. */
 export async function fetchUsage(creds: OAuthCreds): Promise<FetchResult> {
   try {
@@ -147,19 +126,20 @@ export async function fetchUsage(creds: OAuthCreds): Promise<FetchResult> {
 }
 
 /**
- * Periodically polls usage limits for all accounts, refreshing expired tokens.
+ * Periodically polls usage limits for all accounts. Tokens come from CredentialSync,
+ * which refreshes them only under Claude Code's own locks and writes every rotation
+ * back to all local copies, so polling never strands Claude Code with a spent token.
  * Respects a per-account backoff (on 429) and a hard 180s minimum interval.
  */
 export class UsagePoller {
   private timer: NodeJS.Timeout | undefined;
+  private polling: Promise<void> | undefined;
 
   constructor(
     private readonly store: AccountStore,
-    private readonly refresher: TokenRefresher,
-    private readonly credentials: CredentialsManager,
+    private readonly sync: CredentialSync,
     private readonly getIntervalSeconds: () => number,
-    private readonly onUpdate: () => void,
-    private readonly coordination: UsagePollerCoordination = {}
+    private readonly onUpdate: () => void
   ) {}
 
   start(): void {
@@ -181,17 +161,28 @@ export class UsagePoller {
     this.start();
   }
 
-  async pollAll(force: boolean): Promise<void> {
-    // First sync the active profile from the file (fresh tokens).
-    if (this.coordination.syncCurrentProfile) {
-      await this.coordination.syncCurrentProfile();
-    } else {
-      await this.store.syncActiveFromFile(this.credentials.readCurrent());
+  pollAll(force: boolean): Promise<void> {
+    if (this.polling) {
+      return this.polling;
     }
+    this.polling = this.runPollAll(force).finally(() => {
+      this.polling = undefined;
+    });
+    return this.polling;
+  }
 
-    const profiles = this.store.list();
-    for (const profile of profiles) {
-      await this.pollOne(profile.id, force);
+  private async runPollAll(force: boolean): Promise<void> {
+    try {
+      await this.sync.syncCurrent();
+    } catch {
+      /* polling still works from the vault */
+    }
+    for (const profile of this.store.list()) {
+      try {
+        await this.pollOne(profile.id, force);
+      } catch {
+        /* one broken profile must not stop the others */
+      }
     }
     this.onUpdate();
   }
@@ -207,184 +198,49 @@ export class UsagePoller {
       return;
     }
 
-    let creds = await this.store.getCreds(id);
-    if (!creds) {
-      return;
-    }
-    // Always reconcile the per-profile file before honoring a previous auth error.
-    // Claude may have won a refresh race and persisted the valid rotated generation.
-    creds = await this.syncProfileConfigCreds(id, creds);
-    let prev = this.store.get(id)?.lastUsage;
-    if (requiresProfileReauthorization(prev?.error) && this.isProfileActive(id)) {
-      await this.syncActiveProfile();
-      creds = (await this.store.getCreds(id)) ?? creds;
-      prev = this.store.get(id)?.lastUsage;
-    }
-    if (requiresProfileReauthorization(prev?.error)) {
-      return;
-    }
-
-    // Refresh an expired token (it rotates, so save the new one).
-    if (TokenRefresher.isExpired(creds)) {
-      if (this.isProfileActive(id)) {
-        await this.syncActiveProfile();
-        const synced = await this.store.getCreds(id);
-        if (!synced || TokenRefresher.isExpired(synced)) {
-          return;
-        }
-        creds = synced;
+    let fresh = await this.sync.getFreshCreds(id);
+    if (!fresh.ok || !fresh.creds) {
+      if (!fresh.deferred) {
+        await this.recordError(id, fresh.error ?? "Failed to read credentials.");
       }
+      return;
     }
 
-    if (TokenRefresher.isExpired(creds)) {
-      const refreshed = await this.refreshCreds(id, creds, false, prev);
-      if (!refreshed) {
+    let result = await fetchUsage(fresh.creds);
+    if (result.status === 401 || result.status === 403) {
+      fresh = await this.sync.getFreshCreds(id, { rejectedAccessToken: fresh.creds.accessToken });
+      if (!fresh.ok || !fresh.creds) {
+        if (!fresh.deferred) {
+          await this.recordError(id, fresh.error ?? result.error ?? "Unauthorized");
+        }
         return;
       }
-      creds = refreshed;
-    }
-
-    let result = await fetchUsage(creds);
-    if (result.status === 401 || result.status === 403) {
-      if (this.isProfileActive(id)) {
-        await this.syncActiveProfile();
-        const synced = await this.store.getCreds(id);
-        if (!synced || !credentialsChanged(creds, synced)) {
-          return;
-        }
-        creds = synced;
-        result = await fetchUsage(creds);
-      } else {
-        const refreshed = await this.refreshCreds(id, creds, true, prev);
-        if (refreshed) {
-          creds = refreshed;
-          result = await fetchUsage(creds);
-        }
-      }
+      result = await fetchUsage(fresh.creds);
     }
 
     if (result.snapshot) {
       await this.store.updateUsage(id, result.snapshot);
-    } else {
-      await this.store.updateUsage(id, {
-        fetchedAt: Date.now(),
-        windows: prev?.windows ?? [],
-        sessionPercent: prev?.sessionPercent ?? null,
-        weeklyPercent: prev?.weeklyPercent ?? null,
-        error: result.error ?? "Failed to fetch usage",
-        retryAfter: result.retryAfter,
-      });
-    }
-  }
-
-  private async refreshCreds(
-    id: string,
-    credsBeforeLock: OAuthCreds,
-    force: boolean,
-    prev: UsageSnapshot | undefined
-  ): Promise<OAuthCreds | null> {
-    const locked = await withFileLock(`refresh:${id}`, 10_000, async () => {
-      const stored = (await this.store.getCreds(id)) ?? credsBeforeLock;
-      const latest = await this.syncProfileConfigCreds(id, stored);
-
-      if (this.isProfileActive(id)) {
-        return { ok: false as const, deferred: true as const };
-      }
-
-      if (!force && !TokenRefresher.isExpired(latest)) {
-        return { ok: true as const, creds: latest };
-      }
-
-      if (force && latest.accessToken !== credsBeforeLock.accessToken) {
-        return { ok: true as const, creds: latest };
-      }
-
-      const refreshed = await this.refresher.refresh(latest);
-      if (!refreshed.ok || !refreshed.creds) {
-        const recovered = await this.syncProfileConfigCreds(id, latest);
-        if (credentialsChanged(latest, recovered)) {
-          return { ok: true as const, creds: recovered };
+      if (!this.store.get(id)?.authAccountUuid) {
+        const identity = await this.sync.identify(fresh.creds);
+        const saved = this.store.get(id);
+        if (identity && saved && (!profileIdentity(saved) || sameIdentity(profileIdentity(saved)!, identity))) {
+          await this.store.updateIdentity(id, identity);
         }
-        return {
-          ok: false as const,
-          error: "Failed to refresh token: " + (refreshed.error ?? "error"),
-        };
       }
+    } else {
+      await this.recordError(id, result.error ?? "Failed to fetch usage", result.retryAfter);
+    }
+  }
 
-      await this.store.updateCreds(id, refreshed.creds);
-      try {
-        this.coordination.persistRefreshedCreds?.(id, latest, refreshed.creds);
-      } catch {
-        /* SecretStorage remains authoritative and stale replicas cannot replace it. */
-      }
-      return { ok: true as const, creds: refreshed.creds };
+  private async recordError(id: string, error: string, retryAfter?: number): Promise<void> {
+    const prev = this.store.get(id)?.lastUsage;
+    await this.store.updateUsage(id, {
+      fetchedAt: Date.now(),
+      windows: prev?.windows ?? [],
+      sessionPercent: prev?.sessionPercent ?? null,
+      weeklyPercent: prev?.weeklyPercent ?? null,
+      error,
+      retryAfter,
     });
-
-    if (!locked.acquired) {
-      await this.store.updateUsage(id, {
-        fetchedAt: Date.now(),
-        windows: prev?.windows ?? [],
-        sessionPercent: prev?.sessionPercent ?? null,
-        weeklyPercent: prev?.weeklyPercent ?? null,
-        error: "Skipped token refresh because another VS Code window is refreshing it.",
-      });
-      return null;
-    }
-
-    if (!locked.value?.ok) {
-      if (locked.value?.deferred) {
-        return null;
-      }
-      await this.store.updateUsage(id, {
-        fetchedAt: Date.now(),
-        windows: prev?.windows ?? [],
-        sessionPercent: prev?.sessionPercent ?? null,
-        weeklyPercent: prev?.weeklyPercent ?? null,
-        error: locked.value?.error ?? "Failed to refresh token.",
-      });
-      return null;
-    }
-
-    return locked.value.creds;
   }
-
-  private async syncProfileConfigCreds(
-    id: string,
-    stored: OAuthCreds
-  ): Promise<OAuthCreds> {
-    const fileCreds = this.coordination.readProfileCreds?.(id);
-    if (!fileCreds) {
-      return stored;
-    }
-
-    if (!shouldPreferProfileFileCreds(fileCreds, stored)) {
-      return stored;
-    }
-
-    await this.store.updateCreds(id, fileCreds);
-    return fileCreds;
-  }
-
-  private isProfileActive(id: string): boolean {
-    return this.store.getActiveId() === id || this.coordination.isProfileActive?.(id) === true;
-  }
-
-  private async syncActiveProfile(): Promise<void> {
-    if (this.coordination.syncCurrentProfile) {
-      await this.coordination.syncCurrentProfile();
-    }
-  }
-}
-
-function shouldPreferProfileFileCreds(fileCreds: OAuthCreds, stored: OAuthCreds): boolean {
-  return (
-    hasUsableOAuthCreds(stored) && shouldPreferCredentialCandidate(fileCreds, stored)
-  );
-}
-
-function credentialsChanged(previous: OAuthCreds, next: OAuthCreds): boolean {
-  return (
-    !sameNonEmptyToken(previous.accessToken, next.accessToken) ||
-    !sameNonEmptyToken(previous.refreshToken, next.refreshToken)
-  );
 }

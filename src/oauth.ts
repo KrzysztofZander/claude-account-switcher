@@ -1,4 +1,5 @@
-import { OAuthCreds } from "./types";
+import * as crypto from "crypto";
+import { ClaudeAuthIdentity, OAuthCreds } from "./types";
 
 /**
  * Refreshes the Claude Code access token using the refresh token.
@@ -11,6 +12,7 @@ import { OAuthCreds } from "./types";
 export const OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 export const OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 export const CLAUDE_AI_AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize";
+export const OAUTH_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile";
 const OAUTH_BETA = "oauth-2025-04-20";
 export const CLAUDE_CODE_SCOPES = [
   "org:create_api_key",
@@ -19,6 +21,7 @@ export const CLAUDE_CODE_SCOPES = [
   "user:sessions:claude_code",
   "user:mcp_servers",
   "user:file_upload",
+  "user:plugins",
 ];
 const DEFAULT_REFRESH_SCOPES = CLAUDE_CODE_SCOPES.filter(
   (scope) => scope !== "org:create_api_key"
@@ -30,6 +33,8 @@ export interface RefreshResult {
   error?: string;
   status?: number;
   requiresReauthorization?: boolean;
+  /** Account identity returned alongside the rotated tokens. */
+  identity?: ClaudeAuthIdentity;
 }
 
 export class TokenRefresher {
@@ -88,6 +93,8 @@ export class TokenRefresher {
         refresh_token_expires_in?: number;
         expires_in?: number;
         scope?: string;
+        account?: { uuid?: unknown; email_address?: unknown };
+        organization?: { uuid?: unknown; name?: unknown };
       };
 
       if (!data.access_token) {
@@ -106,7 +113,16 @@ export class TokenRefresher {
           : creds.expiresAt,
         scopes: data.scope ? data.scope.split(/\s+/).filter(Boolean) : creds.scopes,
       };
-      return { ok: true, creds: next };
+      return {
+        ok: true,
+        creds: next,
+        identity: identityFrom(
+          data.account?.uuid,
+          data.account?.email_address,
+          data.organization?.uuid,
+          data.organization?.name
+        ),
+      };
     } catch (e) {
       return { ok: false, error: (e as Error).message };
     }
@@ -116,6 +132,67 @@ export class TokenRefresher {
   static isExpired(creds: OAuthCreds): boolean {
     return typeof creds.expiresAt === "number" && creds.expiresAt - 60_000 < Date.now();
   }
+}
+
+/**
+ * Reads the account behind an access token from the same endpoint Claude Code uses
+ * after login. Works without the CLI and identifies a login even after both of its
+ * tokens rotated. Returns undefined for expired/invalid tokens or network errors.
+ */
+export async function fetchOAuthIdentity(
+  accessToken: string
+): Promise<ClaudeAuthIdentity | undefined> {
+  if (!isNonEmptyString(accessToken)) {
+    return undefined;
+  }
+  try {
+    const res = await fetch(OAUTH_PROFILE_URL, {
+      method: "GET",
+      headers: {
+        Authorization: "Bearer " + accessToken,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "anthropic-beta": OAUTH_BETA,
+        "User-Agent": "claude-code-account-switcher",
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) {
+      return undefined;
+    }
+    const data = (await res.json()) as {
+      account?: { uuid?: unknown; email?: unknown; email_address?: unknown };
+      organization?: { uuid?: unknown; name?: unknown };
+    };
+    return identityFrom(
+      data.account?.uuid,
+      data.account?.email ?? data.account?.email_address,
+      data.organization?.uuid,
+      data.organization?.name
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+/** Short stable fingerprint of a token, safe to keep in non-secret metadata. */
+export function tokenFingerprint(token: string): string {
+  return crypto.createHash("sha256").update(token).digest("hex").slice(0, 32);
+}
+
+function identityFrom(
+  accountUuid: unknown,
+  email: unknown,
+  orgId: unknown,
+  orgName: unknown
+): ClaudeAuthIdentity | undefined {
+  const identity: ClaudeAuthIdentity = {
+    accountUuid: isNonEmptyString(accountUuid) ? accountUuid.trim() : undefined,
+    email: isNonEmptyString(email) ? email.trim() : undefined,
+    orgId: isNonEmptyString(orgId) ? orgId.trim() : undefined,
+    orgName: isNonEmptyString(orgName) ? orgName.trim() : undefined,
+  };
+  return identity.accountUuid || identity.email || identity.orgId ? identity : undefined;
 }
 
 function normalizeScopes(scopes: unknown): string[] {

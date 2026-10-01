@@ -1,7 +1,8 @@
+import * as crypto from "crypto";
+import * as fs from "fs";
 import * as vscode from "vscode";
 import { AccountStore } from "./accountStore";
 import { AccountWindowService } from "./accountWindow";
-import { readClaudeAuthStatus } from "./authStatus";
 import { BrowserOAuthLogin } from "./browserOAuth";
 import {
   getConfiguredClaudeCommand,
@@ -9,11 +10,10 @@ import {
   quoteForTerminal,
   resolveClaudeCommand,
 } from "./cli";
-import {
-  hasUsableOAuthCreds,
-  shouldPreferCredentialCandidate,
-} from "./credentialValidation";
+import { CredentialSync, CurrentAccountState } from "./credentialSync";
+import { hasUsableOAuthCreds, sameNonEmptyToken } from "./credentialValidation";
 import { CredentialsManager } from "./credentials";
+import { identityLabel, profileIdentity, sameIdentity } from "./identity";
 import { getAccountConfigDir } from "./isolatedConfig";
 import { TokenRefresher } from "./oauth";
 import { ProfileActivityRegistry } from "./profileActivity";
@@ -21,8 +21,11 @@ import { SwitchService } from "./switchService";
 import { AccountsViewProvider } from "./ui/accountsView";
 import { StatusBarController } from "./ui/statusBar";
 import { UsagePoller } from "./usage";
-import { AccountProfile, ClaudeAuthIdentity } from "./types";
+import { AccountProfile, ClaudeAuthIdentity, OAuthCreds } from "./types";
 import { WarmupService } from "./warmup";
+
+const LOGIN_WATCH_TIMEOUT_MS = 15 * 60_000;
+const CREDENTIALS_WATCH_INTERVAL_MS = 2_000;
 
 export function activate(context: vscode.ExtensionContext): void {
   const store = new AccountStore(context);
@@ -30,17 +33,17 @@ export function activate(context: vscode.ExtensionContext): void {
   const refresher = new TokenRefresher();
   const browserOAuth = new BrowserOAuthLogin();
   const profileActivity = new ProfileActivityRegistry(context);
-  const switchService = new SwitchService(store, credentials);
-  const warmupService = new WarmupService(
-    context,
-    store,
-    credentials,
-    profileActivity
+  const homeDir = (id: string) => getAccountConfigDir(context, id);
+  const sync = new CredentialSync(store, credentials, refresher, homeDir);
+  const switchService = new SwitchService(store, credentials, sync, (id) =>
+    profileActivity.isActive(id, { excludeSelf: true })
   );
+  const warmupService = new WarmupService(context, store, sync, profileActivity);
   const accountWindowService = new AccountWindowService(
     context,
     store,
     credentials,
+    sync,
     profileActivity
   );
   const statusBar = new StatusBarController(store);
@@ -54,6 +57,67 @@ export function activate(context: vscode.ExtensionContext): void {
     viewProvider.refresh();
   };
 
+  // --- Current account tracking ---
+
+  let notifiedUnsavedKey: string | undefined;
+  const applyCurrentState = (state: CurrentAccountState) => {
+    profileActivity.setActiveProfile(store.getActiveId());
+    statusBar.setUnsavedIdentity(state.unsavedIdentity);
+    const key = state.unsavedIdentity ? identityLabel(state.unsavedIdentity) : undefined;
+    if (key && key !== notifiedUnsavedKey) {
+      notifiedUnsavedKey = key;
+      void vscode.window
+        .showInformationMessage(
+          `Claude Code is logged in as ${key}, which is not saved as a profile yet.`,
+          "Save as profile"
+        )
+        .then((choice) => {
+          if (choice === "Save as profile") {
+            void vscode.commands.executeCommand("claudeSwitcher.addCurrentAccount");
+          }
+        });
+    }
+    if (!key) {
+      notifiedUnsavedKey = undefined;
+    }
+  };
+
+  const synchronizeCurrentProfile = async () => {
+    try {
+      applyCurrentState(await sync.syncCurrent());
+    } catch {
+      profileActivity.setActiveProfile(store.getActiveId());
+    }
+  };
+
+  // Claude Code rewrites its credentials file on every token rotation and on
+  // /login. Import each new generation right away instead of waiting for the next
+  // usage poll, so the saved profile never keeps an already spent refresh token.
+  let watchedCredentialsPath: string | undefined;
+  let syncTimer: NodeJS.Timeout | undefined;
+  const onCredentialsFileChanged = () => {
+    if (syncTimer) {
+      clearTimeout(syncTimer);
+    }
+    syncTimer = setTimeout(() => {
+      syncTimer = undefined;
+      void synchronizeCurrentProfile().then(refreshUI);
+    }, 750);
+  };
+  const watchCredentialsFile = () => {
+    const next = credentials.getCredentialsPath();
+    if (watchedCredentialsPath === next) {
+      return;
+    }
+    if (watchedCredentialsPath) {
+      fs.unwatchFile(watchedCredentialsPath, onCredentialsFileChanged);
+    }
+    watchedCredentialsPath = next;
+    fs.watchFile(next, { interval: CREDENTIALS_WATCH_INTERVAL_MS }, onCredentialsFileChanged);
+  };
+
+  // --- Login helpers ---
+
   const authorizeInBrowser = async (configDir?: string) => {
     const result = await vscode.window.withProgress(
       {
@@ -64,7 +128,10 @@ export function activate(context: vscode.ExtensionContext): void {
       () => browserOAuth.authorize((url) => vscode.env.openExternal(vscode.Uri.parse(url)))
     );
     if (result.ok && result.creds) {
-      credentials.writeCreds(result.creds, configDir);
+      credentials.writeCreds(result.creds, configDir, {
+        organizationUuid: result.identity?.orgId ?? null,
+      });
+      sync.rememberIdentity(result.creds, result.identity);
     }
     return result;
   };
@@ -92,93 +159,57 @@ export function activate(context: vscode.ExtensionContext): void {
     });
     terminal.show();
     terminal.sendText(`${quoteForTerminal(resolvedCommand)} auth login`);
-    return { ok: true, usedBrowser: false, identity: undefined };
+    return { ok: true, usedBrowser: false, identity: undefined as ClaudeAuthIdentity | undefined };
   };
 
-  const backfillKnownIdentities = async () => {
-    for (const profile of store.list()) {
-      if (profileHasIdentity(profile)) {
-        continue;
-      }
-      const configDir = getAccountConfigDir(context, profile.id);
-      if (!hasUsableOAuthCreds(credentials.readCurrent(configDir))) {
-        continue;
-      }
-      const status = await readClaudeAuthStatus(configDir);
-      if (status.ok && status.status?.loggedIn) {
-        await store.updateIdentity(profile.id, status.status);
-      }
-    }
-
-    const activeId = store.getActiveId();
-    const activeProfile = activeId ? store.get(activeId) : undefined;
-    if (activeId && activeProfile && !profileHasIdentity(activeProfile)) {
-      const status = await readClaudeAuthStatus(credentials.getConfigDir());
-      if (status.ok && status.status?.loggedIn) {
-        await store.updateIdentity(activeId, status.status);
-      }
-    }
-  };
-
-  const synchronizeCurrentProfile = async () => {
-    const fileCreds = credentials.readCurrent();
-    if (!fileCreds) {
-      profileActivity.setActiveProfile(store.getActiveId());
-      return;
-    }
-
-    const tokenMatchedId = await store.findByTokens(fileCreds);
-    let identity: ClaudeAuthIdentity | undefined;
-    if (!tokenMatchedId) {
-      const status = await readClaudeAuthStatus(credentials.getConfigDir());
-      if (status.ok && status.status?.loggedIn) {
-        identity = status.status;
-        const rememberedId = store.getActiveId();
-        const remembered = rememberedId ? store.get(rememberedId) : undefined;
-        if (
-          rememberedId &&
-          remembered &&
-          !profileHasIdentity(remembered) &&
-          !store.findByIdentity(identity, rememberedId)
-        ) {
-          await store.updateIdentity(rememberedId, identity);
+  /**
+   * Resolves once an isolated login wrote new usable credentials into `configDir`
+   * (or after a timeout), so the user does not have to click "Complete" manually.
+   */
+  const pendingLoginWatches = new Set<() => void>();
+  const waitForLogin = (configDir: string, previous: OAuthCreds | null) =>
+    new Promise<boolean>((resolve) => {
+      const file = credentials.getCredentialsPath(configDir);
+      let settled = false;
+      const finish = (value: boolean) => {
+        if (settled) {
+          return;
         }
-      }
-    }
+        settled = true;
+        fs.unwatchFile(file, check);
+        clearTimeout(timeout);
+        pendingLoginWatches.delete(cancel);
+        resolve(value);
+      };
+      const cancel = () => finish(false);
+      const check = () => {
+        const creds = credentials.readCurrent(configDir);
+        if (
+          creds &&
+          hasUsableOAuthCreds(creds) &&
+          !(previous && sameNonEmptyToken(previous.refreshToken, creds.refreshToken))
+        ) {
+          finish(true);
+        }
+      };
+      const timeout = setTimeout(cancel, LOGIN_WATCH_TIMEOUT_MS);
+      pendingLoginWatches.add(cancel);
+      fs.watchFile(file, { interval: 1_000 }, check);
+      check();
+    });
 
-    await store.syncActiveFromFile(fileCreds, identity);
-    const activeId = store.getActiveId();
-    profileActivity.setActiveProfile(activeId);
-
-    const activeProfile = activeId ? store.get(activeId) : undefined;
-    const activeCreds = activeId ? await store.getCreds(activeId) : null;
-    const fileIdentityVerified = Boolean(
-      activeId &&
-        (tokenMatchedId === activeId ||
-          (identity && activeProfile && profileIdentityMatches(activeProfile, identity)))
-    );
-    if (
-      activeCreds &&
-      fileIdentityVerified &&
-      (activeCreds.accessToken !== fileCreds.accessToken ||
-        activeCreds.refreshToken !== fileCreds.refreshToken) &&
-      shouldPreferCredentialCandidate(activeCreds, fileCreds)
-    ) {
-      credentials.writeCredsIfCurrent(fileCreds, activeCreds);
-    }
-  };
+  // --- Isolated reauthorization of a saved profile ---
 
   const completeProfileReauthorization = async (
     id: string,
-    silentWhenMissing = false,
-    browserIdentity?: ClaudeAuthIdentity
+    silentWhenMissing = false
   ): Promise<{ ok: boolean; message: string; missing?: boolean }> => {
     const profile = store.get(id);
     if (!profile) {
       return { ok: false, message: "Profile not found." };
     }
 
-    const configDir = getAccountConfigDir(context, id);
+    const configDir = homeDir(id);
     const creds = credentials.readCurrent(configDir);
     if (!creds || !hasUsableOAuthCreds(creds)) {
       return {
@@ -188,28 +219,14 @@ export function activate(context: vscode.ExtensionContext): void {
       };
     }
 
-    let identity = browserIdentity;
+    const identity = await sync.identify(creds, configDir);
     if (!identity) {
-      const status = await readClaudeAuthStatus(configDir);
-      if (!status.ok || !status.status?.loggedIn) {
-        return {
-          ok: false,
-          message:
-            `Could not verify the isolated login for "${profile.label}": ` +
-            (status.error ?? "Claude auth status did not report a logged-in account."),
-        };
-      }
-      identity = status.status;
-    }
-    if (!identity.email && !identity.orgId) {
       return {
         ok: false,
-        message: `Could not verify the identity for "${profile.label}" after authorization.`,
+        message: `Could not verify which Claude account the isolated login for "${profile.label}" belongs to.`,
       };
     }
 
-    await backfillKnownIdentities();
-    const latestProfile = store.get(id) ?? profile;
     const conflict = store.findByIdentity(identity, id);
     if (conflict) {
       return {
@@ -220,7 +237,7 @@ export function activate(context: vscode.ExtensionContext): void {
       };
     }
 
-    const previousIdentity = profileIdentity(latestProfile);
+    const previousIdentity = profileIdentity(profile);
     if (previousIdentity && !sameIdentity(previousIdentity, identity)) {
       return {
         ok: false,
@@ -233,6 +250,7 @@ export function activate(context: vscode.ExtensionContext): void {
     await store.updateCreds(id, creds);
     await store.updateIdentity(id, identity);
     await store.clearUsageError(id);
+    await sync.captureOAuthAccount(id, configDir);
     return {
       ok: true,
       message: `Reauthorized "${profile.label}" as ${identityLabel(identity)}.`,
@@ -246,7 +264,7 @@ export function activate(context: vscode.ExtensionContext): void {
       return;
     }
 
-    const configDir = getAccountConfigDir(context, id);
+    const configDir = homeDir(id);
     try {
       credentials.moveCredentialsAside(configDir, "reauth-backup");
     } catch (e) {
@@ -261,50 +279,124 @@ export function activate(context: vscode.ExtensionContext): void {
     if (!login.ok) {
       return;
     }
-    if (login.usedBrowser) {
-      const res = await completeProfileReauthorization(id, false, login.identity);
+
+    const finish = async () => {
+      const res = await completeProfileReauthorization(id);
       vscode.window[res.ok ? "showInformationMessage" : "showWarningMessage"](res.message);
+      if (res.ok) {
+        await poller.pollOne(id, true);
+      }
+      refreshUI();
+    };
+
+    if (login.usedBrowser || (await waitForLogin(configDir, null))) {
+      await finish();
+      return;
+    }
+    const choice = await vscode.window.showInformationMessage(
+      `The isolated login for "${profile.label}" was not detected. Complete it manually once you finished logging in.`,
+      "Complete reauthorization"
+    );
+    if (choice === "Complete reauthorization") {
+      await finish();
+    }
+  };
+
+  // --- Adding another account without touching the current one ---
+
+  const importIsolatedLogin = async (id: string, configDir: string) => {
+    const creds = credentials.readCurrent(configDir);
+    if (!creds || !hasUsableOAuthCreds(creds)) {
+      vscode.window.showWarningMessage("No completed Claude login was found.");
+      return;
+    }
+    const identity = await sync.identify(creds, configDir);
+    const existing = identity ? store.findByIdentity(identity) : undefined;
+    if (existing) {
+      await store.updateCreds(existing.id, creds);
+      if (identity) {
+        await store.updateIdentity(existing.id, identity);
+      }
+      await store.clearUsageError(existing.id);
+      await sync.captureOAuthAccount(existing.id, configDir);
+      fs.rmSync(configDir, { recursive: true, force: true });
+      vscode.window.showInformationMessage(
+        `This login belongs to the saved profile "${existing.label}"; it was refreshed with the new login.`
+      );
+      await poller.pollOne(existing.id, true);
       refreshUI();
       return;
     }
 
-    const choice = await vscode.window.showInformationMessage(
-      `Started isolated login for "${profile.label}". This does not change the current Claude Code account. Finish the login, then complete the reauthorization.`,
-      "Complete reauthorization"
-    );
-    if (choice === "Complete reauthorization") {
-      const res = await completeProfileReauthorization(id);
-      vscode.window[res.ok ? "showInformationMessage" : "showWarningMessage"](res.message);
-      refreshUI();
+    const label = await vscode.window.showInputBox({
+      title: "Save the new Claude account",
+      prompt: "Profile name (e.g. Work, Personal, Max #1)",
+      value: identity?.email ?? (creds.subscriptionType ? `${creds.subscriptionType} account` : "New account"),
+      validateInput: (v) => (v.trim().length === 0 ? "Enter a name" : undefined),
+    });
+    if (label === undefined) {
+      fs.rmSync(configDir, { recursive: true, force: true });
+      return;
     }
+    const profile = await store.addFromCreds(label.trim(), creds, {
+      id,
+      identity,
+      activate: false,
+    });
+    await sync.captureOAuthAccount(profile.id, configDir);
+    vscode.window.showInformationMessage(
+      `Saved "${profile.label}". The current Claude Code account was not changed; use Switch when you need it.`
+    );
+    await poller.pollOne(profile.id, true);
+    refreshUI();
   };
 
-  const poller = new UsagePoller(
-    store,
-    refresher,
-    credentials,
-    getInterval,
-    refreshUI,
-    {
-      readProfileCreds: (id) => credentials.readCurrent(getAccountConfigDir(context, id)),
-      syncCurrentProfile: synchronizeCurrentProfile,
-      isProfileActive: (id) => profileActivity.isActive(id),
-      persistRefreshedCreds: (id, previous, next) => {
-        credentials.writeCredsIfCurrent(previous, next);
-        credentials.writeCredsIfCurrent(previous, next, getAccountConfigDir(context, id));
-      },
+  const addAccount = async () => {
+    const id = crypto.randomUUID();
+    const configDir = homeDir(id);
+    fs.mkdirSync(configDir, { recursive: true });
+    const login = await openClaudeLogin({ configDir, terminalName: "Claude Login: new account" });
+    if (!login.ok) {
+      fs.rmSync(configDir, { recursive: true, force: true });
+      return;
     }
-  );
+    if (!login.usedBrowser) {
+      vscode.window.showInformationMessage(
+        "Finish the login in the terminal/browser. The current Claude Code account stays untouched; the new account is saved automatically."
+      );
+      if (!(await waitForLogin(configDir, null))) {
+        fs.rmSync(configDir, { recursive: true, force: true });
+        vscode.window.showWarningMessage("No completed Claude login was detected. Nothing was saved.");
+        return;
+      }
+    }
+    await importIsolatedLogin(id, configDir);
+  };
+
+  const poller = new UsagePoller(store, sync, getInterval, refreshUI);
 
   // Publish the remembered owner before asynchronous startup work, so another
-  // extension host cannot consume this window's refresh token during restart.
+  // window does not start a second session on this login during restart.
   profileActivity.setActiveProfile(store.getActiveId());
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(AccountsViewProvider.viewType, viewProvider),
     statusBar,
     profileActivity,
-    { dispose: () => poller.stop() }
+    { dispose: () => poller.stop() },
+    {
+      dispose: () => {
+        if (watchedCredentialsPath) {
+          fs.unwatchFile(watchedCredentialsPath, onCredentialsFileChanged);
+        }
+        if (syncTimer) {
+          clearTimeout(syncTimer);
+        }
+        for (const cancel of [...pendingLoginWatches]) {
+          cancel();
+        }
+      },
+    }
   );
 
   // --- Commands ---
@@ -313,16 +405,17 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("claudeSwitcher.addCurrentAccount", async () => {
       const res = await switchService.captureCurrent();
       vscode.window[res.ok ? "showInformationMessage" : "showWarningMessage"](res.message);
-      if (res.ok) {
-        const activeId = store.getActiveId();
-        profileActivity.setActiveProfile(activeId);
-        if (activeId) {
-          await poller.pollOne(activeId, true);
-        }
+      await synchronizeCurrentProfile();
+      const activeId = store.getActiveId();
+      if (res.ok && activeId) {
+        await poller.pollOne(activeId, true);
       }
-      profileActivity.setActiveProfile(store.getActiveId());
       refreshUI();
     })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("claudeSwitcher.addAccount", () => addAccount())
   );
 
   context.subscriptions.push(
@@ -344,25 +437,12 @@ export function activate(context: vscode.ExtensionContext): void {
         if (res.reauthProfileId) {
           const choice = await vscode.window.showWarningMessage(
             `${res.message} Reauthorize this profile in an isolated Claude login so another saved account cannot overwrite it.`,
-            "Reauthorize profile",
-            "Complete reauthorization"
+            "Reauthorize profile"
           );
           if (choice === "Reauthorize profile") {
             await startProfileReauthorization(res.reauthProfileId);
-          } else if (choice === "Complete reauthorization") {
-            const completed = await completeProfileReauthorization(res.reauthProfileId);
-            vscode.window[completed.ok ? "showInformationMessage" : "showWarningMessage"](
-              completed.message
-            );
-            if (completed.ok) {
-              res = await switchService.switchTo(targetId);
-              profileActivity.setActiveProfile(store.getActiveId());
-              if (!res.ok) {
-                vscode.window.showWarningMessage(res.message);
-              }
-            }
           }
-        } else {
+        } else if (res.message !== "Cancelled.") {
           vscode.window.showWarningMessage(res.message);
         }
       }
@@ -415,16 +495,22 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("claudeSwitcher.login", () => void openClaudeLogin())
+    vscode.commands.registerCommand("claudeSwitcher.login", async () => {
+      // Save the outgoing login's latest rotation before Claude Code replaces it.
+      await synchronizeCurrentProfile();
+      await openClaudeLogin();
+    })
   );
 
   context.subscriptions.push(
     vscode.commands.registerCommand("claudeSwitcher.browserLogin", async () => {
+      await synchronizeCurrentProfile();
       const result = await authorizeInBrowser();
       if (result.ok) {
         vscode.window.showInformationMessage(
-          "Claude authorization completed in the browser. Save the current account as a profile."
+          "Claude authorization completed in the browser. Reload the window so Claude Code uses it."
         );
+        await synchronizeCurrentProfile();
       } else {
         vscode.window.showWarningMessage(
           `Browser authorization failed: ${result.error ?? "unknown error"}`
@@ -454,18 +540,7 @@ export function activate(context: vscode.ExtensionContext): void {
         const res = await completeProfileReauthorization(targetId);
         vscode.window[res.ok ? "showInformationMessage" : "showWarningMessage"](res.message);
         if (res.ok) {
-          const profile = store.get(targetId);
-          const choice = await vscode.window.showInformationMessage(
-            `Switch to "${profile?.label ?? targetId}" now?`,
-            "Switch now"
-          );
-          if (choice === "Switch now") {
-            const switched = await switchService.switchTo(targetId);
-            profileActivity.setActiveProfile(store.getActiveId());
-            vscode.window[switched.ok ? "showInformationMessage" : "showWarningMessage"](
-              switched.message
-            );
-          }
+          await poller.pollOne(targetId, true);
         }
         refreshUI();
       }
@@ -526,7 +601,7 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
-  // React to interval setting changes.
+  // React to setting changes.
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("claudeSwitcher.pollIntervalSeconds")) {
@@ -535,15 +610,18 @@ export function activate(context: vscode.ExtensionContext): void {
       if (e.affectsConfiguration("claudeSwitcher.warnThresholdPercent")) {
         refreshUI();
       }
+      if (e.affectsConfiguration("claudeSwitcher.credentialsPath")) {
+        watchCredentialsFile();
+        onCredentialsFileChanged();
+      }
     })
   );
 
-  void synchronizeCurrentProfile()
-    .catch(() => undefined)
-    .then(() => {
-      refreshUI();
-      poller.start();
-    });
+  watchCredentialsFile();
+  void synchronizeCurrentProfile().then(() => {
+    refreshUI();
+    poller.start();
+  });
 }
 
 export function deactivate(): void {
@@ -652,53 +730,4 @@ async function pickWindowTargets(store: AccountStore): Promise<string[] | undefi
     matchOnDescription: true,
   });
   return picked?.ids;
-}
-
-function profileHasIdentity(profile: AccountProfile): boolean {
-  return Boolean(profileIdentity(profile));
-}
-
-function profileIdentity(profile: AccountProfile): ClaudeAuthIdentity | undefined {
-  const email = normalizeEmail(profile.authEmail);
-  const orgId = normalizeIdentityValue(profile.authOrgId);
-  if (!email && !orgId) {
-    return undefined;
-  }
-  return {
-    email: profile.authEmail,
-    orgId: profile.authOrgId,
-    orgName: profile.authOrgName,
-  };
-}
-
-function profileIdentityMatches(
-  profile: AccountProfile,
-  identity: ClaudeAuthIdentity
-): boolean {
-  const saved = profileIdentity(profile);
-  return saved ? sameIdentity(saved, identity) : false;
-}
-
-function sameIdentity(a: ClaudeAuthIdentity, b: ClaudeAuthIdentity): boolean {
-  const aOrgId = normalizeIdentityValue(a.orgId);
-  const bOrgId = normalizeIdentityValue(b.orgId);
-  if (aOrgId && bOrgId) {
-    return aOrgId === bOrgId;
-  }
-  const aEmail = normalizeEmail(a.email);
-  const bEmail = normalizeEmail(b.email);
-  return Boolean(aEmail && bEmail && aEmail === bEmail);
-}
-
-function identityLabel(identity: ClaudeAuthIdentity): string {
-  return identity.email ?? identity.orgName ?? identity.orgId ?? "unknown account";
-}
-
-function normalizeEmail(value: string | undefined): string | undefined {
-  return normalizeIdentityValue(value)?.toLowerCase();
-}
-
-function normalizeIdentityValue(value: string | undefined): string | undefined {
-  const trimmed = value?.trim();
-  return trimmed ? trimmed : undefined;
 }

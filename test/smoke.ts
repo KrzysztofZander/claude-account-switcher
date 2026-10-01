@@ -1,13 +1,17 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { parseUsage } from "../src/usage";
+import { parseUsage, UsagePoller } from "../src/usage";
 import { CredentialsManager } from "../src/credentials";
 import { requiresProfileReauthorization, TokenRefresher } from "../src/oauth";
 import { AccountStore } from "../src/accountStore";
 import { buildBrowserAuthorizationUrl, parseBrowserTokenResponse } from "../src/browserOAuth";
+import { claudeLockPaths, withClaudeConfigLocks } from "../src/claudeLock";
+import { CredentialSync } from "../src/credentialSync";
+import { sameIdentity } from "../src/identity";
 import { ProfileActivityRegistry } from "../src/profileActivity";
 import { SwitchService } from "../src/switchService";
+import { ClaudeAuthIdentity, OAuthCreds } from "../src/types";
 
 let failures = 0;
 function check(name: string, cond: boolean): void {
@@ -181,32 +185,6 @@ async function runAccountStoreTests(): Promise<void> {
     expiresAt: 111,
     scopes: [],
   });
-  await store.syncActiveFromFile({
-    accessToken: "fresh-access",
-    refreshToken: "fresh-refresh",
-    expiresAt: 222,
-    scopes: ["user:profile"],
-  });
-  check(
-    "does not repair incomplete profile from unmatched current file",
-    (await store.getCreds(profile.id))?.refreshToken === ""
-  );
-  check("keeps remembered active marker when an unmatched file cannot be identified", store.getActiveId() === profile.id);
-
-  await store.updateIdentity(profile.id, { email: "owner@example.com", orgId: "org-1" });
-  await store.syncActiveFromFile(
-    {
-      accessToken: "rotated-access",
-      refreshToken: "rotated-refresh",
-      expiresAt: 333,
-      scopes: ["user:profile"],
-    },
-    { email: "owner@example.com", orgId: "org-1" }
-  );
-  check(
-    "imports a fully rotated active file by verified account identity",
-    (await store.getCreds(profile.id))?.refreshToken === "rotated-refresh"
-  );
 
   const noRefreshStore = createStore();
   await noRefreshStore.addFromCreds("A", {
@@ -245,239 +223,351 @@ async function runAccountStoreTests(): Promise<void> {
     error: "Failed to refresh token: HTTP 400 invalid_grant",
     retryAfter: 666,
   });
+  await store.markRefreshTokenDead(profile.id, "stored-refresh");
   await store.updateCreds(profile.id, {
     accessToken: "reauth-access",
     refreshToken: "reauth-refresh",
     expiresAt: 777,
     scopes: ["user:profile"],
   });
-  const reauthedUsage = store.get(profile.id)?.lastUsage;
-  check("new credentials clear auth error", reauthedUsage?.error === undefined);
-  check("new credentials clear retry backoff", reauthedUsage?.retryAfter === undefined);
+  const reauthed = store.get(profile.id);
+  check("new credentials clear auth error", reauthed?.lastUsage?.error === undefined);
+  check("new credentials clear retry backoff", reauthed?.lastUsage?.retryAfter === undefined);
+  check("new credentials clear the dead-token marker", reauthed?.deadRefreshTokenHash === undefined);
+
+  await store.updateIdentity(profile.id, { email: "owner@example.com", orgId: "org-1" });
+  await store.updateIdentity(profile.id, { accountUuid: "acct-1" });
+  check(
+    "identity updates merge instead of dropping known fields",
+    store.get(profile.id)?.authEmail === "owner@example.com" &&
+      store.get(profile.id)?.authAccountUuid === "acct-1"
+  );
+}
+
+function runIdentityTests(): void {
+  console.log("Identity:");
+  check(
+    "same account uuid matches",
+    sameIdentity({ accountUuid: "a", orgId: "o" }, { accountUuid: "a", email: "x@y" })
+  );
+  check(
+    "two people in one Team organization are different accounts",
+    !sameIdentity({ email: "anna@team.com", orgId: "team" }, { email: "bob@team.com", orgId: "team" })
+  );
+  check(
+    "one person in two organizations are different subscriptions",
+    !sameIdentity({ email: "me@x.com", orgId: "personal" }, { email: "me@x.com", orgId: "team" })
+  );
+  check("email comparison ignores case", sameIdentity({ email: "Me@X.com" }, { email: "me@x.com" }));
+  check(
+    "legacy org-only identities still match",
+    sameIdentity({ orgId: "o" }, { orgId: "o" })
+  );
+}
+
+async function runClaudeLockTests(): Promise<void> {
+  console.log("Claude Code compatible lock:");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cas-lock-test-"));
+  const configDir = path.join(dir, "config");
+  const [primary, legacy] = claudeLockPaths(configDir);
+
+  let sawLocks = false;
+  const result = await withClaudeConfigLocks([configDir], 1_000, async () => {
+    sawLocks = fs.statSync(primary).isDirectory() && fs.existsSync(legacy);
+    return 42;
+  });
+  check("uses Claude Code's .oauth_refresh.lock and legacy <dir>.lock", sawLocks);
+  check("returns the action value", result.acquired && result.value === 42);
+  check("releases both locks", !fs.existsSync(primary) && !fs.existsSync(legacy));
+
+  fs.mkdirSync(primary);
+  const busy = await withClaudeConfigLocks([configDir], 400, async () => 1);
+  check("waits for a lock held by Claude Code", !busy.acquired);
+  check("does not leave a partial lock behind", !fs.existsSync(legacy));
+
+  const old = new Date(Date.now() - 120_000);
+  fs.utimesSync(primary, old, old);
+  const stale = await withClaudeConfigLocks([configDir], 400, async () => 2);
+  check("takes over a stale lock like proper-lockfile", stale.acquired && stale.value === 2);
+
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+interface SyncFixture {
+  root: string;
+  globalDir: string;
+  store: AccountStore;
+  manager: CredentialsManager;
+  sync: CredentialSync;
+  homeDir: (id: string) => string;
+}
+
+function createSyncFixture(identities: Record<string, ClaudeAuthIdentity> = {}): SyncFixture {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cas-sync-test-"));
+  const globalDir = path.join(root, "global");
+  fs.mkdirSync(globalDir, { recursive: true });
+  process.env.CLAUDE_CONFIG_DIR = globalDir;
+  process.env.TEST_CRED_PATH = path.join(globalDir, ".credentials.json");
+  const store = createStore();
+  const manager = new CredentialsManager();
+  const homeDir = (id: string) => path.join(root, "homes", id);
+  const sync = new CredentialSync(store, manager, new TokenRefresher(), homeDir, async (creds) =>
+    identities[creds.accessToken]
+  );
+  return { root, globalDir, store, manager, sync, homeDir };
+}
+
+function creds(name: string, expiresInMs: number, extra: Partial<OAuthCreds> = {}): OAuthCreds {
+  return {
+    accessToken: `${name}-access`,
+    refreshToken: `${name}-refresh`,
+    expiresAt: Date.now() + expiresInMs,
+    scopes: ["user:profile", "user:inference"],
+    ...extra,
+  };
+}
+
+async function runCredentialSyncTests(): Promise<void> {
+  console.log("CredentialSync:");
+  const originalFetch = globalThis.fetch;
+  let tokenCalls = 0;
+  let tokenResponse: () => Response = () => new Response("{}", { status: 500 });
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    if (String(input).includes("/oauth/token")) {
+      tokenCalls++;
+      return tokenResponse();
+    }
+    return new Response("{}", { status: 404 });
+  }) as typeof fetch;
+
+  try {
+    // 1. Claude Code rotated both tokens of the active login while we were not looking.
+    {
+      const f = createSyncFixture({
+        "gen2-access": { accountUuid: "acct-a", email: "a@example.com" },
+      });
+      const a = await f.store.addFromCreds("A", creds("gen1", 3_600_000), {
+        identity: { accountUuid: "acct-a", email: "a@example.com" },
+      });
+      f.manager.writeCreds(creds("gen2", 7_200_000));
+      const state = await f.sync.syncCurrent();
+      check("identifies a fully rotated active file by account", state.ownerId === a.id);
+      check(
+        "imports the rotated generation into the saved profile",
+        (await f.store.getCreds(a.id))?.refreshToken === "gen2-refresh"
+      );
+      fs.rmSync(f.root, { recursive: true, force: true });
+    }
+
+    // 2. A verified login of another, unsaved account is not imported into a profile.
+    {
+      const f = createSyncFixture({
+        "other-access": { accountUuid: "acct-other", email: "other@example.com" },
+      });
+      const a = await f.store.addFromCreds("A", creds("a1", 3_600_000), {
+        identity: { accountUuid: "acct-a", email: "a@example.com" },
+      });
+      f.manager.writeCreds(creds("other", 3_600_000));
+      const state = await f.sync.syncCurrent();
+      check("reports an unsaved login", state.unsavedIdentity?.email === "other@example.com");
+      check("clears the active marker for an unsaved login", f.store.getActiveId() === undefined);
+      check(
+        "never copies another account's tokens into a profile",
+        (await f.store.getCreds(a.id))?.refreshToken === "a1-refresh"
+      );
+      fs.rmSync(f.root, { recursive: true, force: true });
+    }
+
+    // 3. A newer generation in the isolated dir is used without spending anything.
+    {
+      const f = createSyncFixture();
+      const b = await f.store.addFromCreds("B", creds("b1", -60_000), { activate: false });
+      f.manager.writeCreds(creds("b2", 3_600_000), f.homeDir(b.id));
+      tokenCalls = 0;
+      const fresh = await f.sync.getFreshCreds(b.id);
+      check("adopts the newest generation from any copy", fresh.creds?.refreshToken === "b2-refresh");
+      check("does not refresh when a valid generation exists", tokenCalls === 0);
+      fs.rmSync(f.root, { recursive: true, force: true });
+    }
+
+    // 4. Expired everywhere: refresh under Claude's lock and write back to every copy.
+    {
+      const f = createSyncFixture();
+      const a = await f.store.addFromCreds("A", creds("a1", -60_000));
+      f.manager.writeCreds(creds("a1", -60_000));
+      tokenCalls = 0;
+      let lockHeldDuringRefresh = false;
+      tokenResponse = () => {
+        lockHeldDuringRefresh = fs.existsSync(path.join(f.globalDir, ".oauth_refresh.lock"));
+        return new Response(
+          JSON.stringify({
+            access_token: "a2-access",
+            refresh_token: "a2-refresh",
+            expires_in: 28_800,
+            account: { uuid: "acct-a", email_address: "a@example.com" },
+            organization: { uuid: "org-a" },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      };
+      const fresh = await f.sync.getFreshCreds(a.id);
+      check("refreshes an expired login once", fresh.ok && tokenCalls === 1);
+      check("holds Claude Code's lock while spending the refresh token", lockHeldDuringRefresh);
+      check(
+        "writes the rotation back to Claude Code's credentials file",
+        f.manager.readCurrent()?.refreshToken === "a2-refresh"
+      );
+      check(
+        "stores the rotation in the vault",
+        (await f.store.getCreds(a.id))?.refreshToken === "a2-refresh"
+      );
+      check("records the account identity from the token response", f.store.get(a.id)?.authAccountUuid === "acct-a");
+      fs.rmSync(f.root, { recursive: true, force: true });
+    }
+
+    // 5. invalid_grant: never retried; a later login in the isolated dir recovers it.
+    {
+      const f = createSyncFixture();
+      const b = await f.store.addFromCreds("B", creds("dead", -60_000), { activate: false });
+      tokenCalls = 0;
+      tokenResponse = () =>
+        new Response(JSON.stringify({ error: "invalid_grant" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        });
+      const first = await f.sync.getFreshCreds(b.id);
+      const second = await f.sync.getFreshCreds(b.id);
+      check("invalid_grant requires reauthorization", first.needsReauthorization === true);
+      check("a rejected refresh token is never sent again", second.needsReauthorization === true && tokenCalls === 1);
+      f.manager.writeCreds(creds("relogin", 3_600_000), f.homeDir(b.id));
+      const recovered = await f.sync.getFreshCreds(b.id);
+      check("recovers as soon as a new generation appears", recovered.creds?.refreshToken === "relogin-refresh");
+      check("recovery clears the dead marker", f.store.get(b.id)?.deadRefreshTokenHash === undefined);
+      fs.rmSync(f.root, { recursive: true, force: true });
+    }
+
+    // 6. Claude Code is refreshing right now: back off instead of racing it.
+    {
+      const f = createSyncFixture();
+      const a = await f.store.addFromCreds("A", creds("a1", -60_000));
+      f.manager.writeCreds(creds("a1", -60_000));
+      fs.mkdirSync(path.join(f.globalDir, ".oauth_refresh.lock"));
+      tokenCalls = 0;
+      const sync = f.sync as unknown as { getFreshCreds: CredentialSync["getFreshCreds"] };
+      const started = Date.now();
+      const fresh = await Promise.race([
+        sync.getFreshCreds(a.id),
+        new Promise<{ deferred: true }>((resolve) => setTimeout(() => resolve({ deferred: true }), 20_000)),
+      ]);
+      check("defers while Claude Code holds the refresh lock", "deferred" in fresh && fresh.deferred === true);
+      check("does not spend the token Claude Code is refreshing", tokenCalls === 0);
+      check("gives up within the lock timeout", Date.now() - started < 20_000);
+      fs.rmSync(f.root, { recursive: true, force: true });
+    }
+
+    // 7. Switching saves the outgoing rotation, then installs the target login.
+    {
+      const f = createSyncFixture({
+        "a2-access": { accountUuid: "acct-a", email: "a@example.com" },
+      });
+      const a = await f.store.addFromCreds("A", creds("a1", 3_600_000), {
+        identity: { accountUuid: "acct-a", email: "a@example.com", orgId: "org-a" },
+      });
+      const b = await f.store.addFromCreds(
+        "B",
+        creds("b1", 3_600_000),
+        {
+          identity: { accountUuid: "acct-b", email: "b@example.com", orgId: "org-b" },
+          activate: false,
+        }
+      );
+      await f.store.setOAuthAccount(b.id, { accountUuid: "acct-b", emailAddress: "b@example.com" });
+      f.manager.writeCreds(creds("a2", 7_200_000), undefined, { organizationUuid: "org-a" });
+      fs.writeFileSync(
+        path.join(f.globalDir, ".claude.json"),
+        JSON.stringify({ keep: 1, oauthAccount: { accountUuid: "acct-a" } })
+      );
+      const state = await f.sync.syncCurrent();
+      const installed = await f.sync.installInConfigDir(b.id, f.globalDir, state.ownerId);
+      const raw = JSON.parse(fs.readFileSync(path.join(f.globalDir, ".credentials.json"), "utf8"));
+      const config = JSON.parse(fs.readFileSync(path.join(f.globalDir, ".claude.json"), "utf8"));
+      check("switch succeeds", installed.ok === true && f.store.getActiveId() === b.id);
+      check(
+        "outgoing profile keeps Claude Code's latest rotation",
+        (await f.store.getCreds(a.id))?.refreshToken === "a2-refresh"
+      );
+      check("target tokens are written", raw.claudeAiOauth.refreshToken === "b1-refresh");
+      check("organizationUuid follows the target account", raw.organizationUuid === "org-b");
+      check(
+        "Claude Code's cached oauthAccount follows the target account",
+        config.oauthAccount.accountUuid === "acct-b" && config.keep === 1
+      );
+      fs.rmSync(f.root, { recursive: true, force: true });
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete process.env.CLAUDE_CONFIG_DIR;
+  }
 }
 
 async function runUsagePollerTests(): Promise<void> {
   console.log("UsagePoller:");
-  const { UsagePoller } = await import("../src/usage");
-  const store = createStore();
-  const profile = await store.addFromCreds("Good", {
-    accessToken: "stored-access",
-    refreshToken: "stored-refresh",
-    expiresAt: Date.now() + 3_600_000,
-    scopes: ["user:profile"],
-  });
-  const poller = new UsagePoller(
-    store,
-    new TokenRefresher(),
-    new CredentialsManager(),
-    () => 240,
-    () => undefined,
-    {
-      readProfileCreds: () => ({
-        accessToken: "",
-        refreshToken: "",
-        expiresAt: 0,
-        refreshTokenExpiresAt: Date.now() + 7_200_000,
-        scopes: ["user:profile"],
-      }),
-    }
-  );
-  await (poller as never as { syncProfileConfigCreds(id: string, stored: unknown): Promise<unknown> })
-    .syncProfileConfigCreds(profile.id, await store.getCreds(profile.id));
-  check(
-    "ignores incomplete isolated profile credentials",
-    (await store.getCreds(profile.id))?.refreshToken === "stored-refresh"
-  );
-
-  const brokenStore = createStore();
-  const brokenProfile = await brokenStore.addFromCreds("Broken", {
-    accessToken: "stored-access",
-    refreshToken: "",
-    expiresAt: 0,
-    scopes: [],
-  });
-  const brokenPoller = new UsagePoller(
-    brokenStore,
-    new TokenRefresher(),
-    new CredentialsManager(),
-    () => 240,
-    () => undefined,
-    {
-      readProfileCreds: () => ({
-        accessToken: "other-access",
-        refreshToken: "other-refresh",
-        expiresAt: Date.now() + 3_600_000,
-        scopes: ["user:profile"],
-      }),
-    }
-  );
-  await (brokenPoller as never as { syncProfileConfigCreds(id: string, stored: unknown): Promise<unknown> })
-    .syncProfileConfigCreds(brokenProfile.id, await brokenStore.getCreds(brokenProfile.id));
-  check(
-    "does not import isolated credentials over incomplete stored profile",
-    (await brokenStore.getCreds(brokenProfile.id))?.refreshToken === ""
-  );
-
-  const restartStore = createStore();
-  const refreshExpiry = Date.now() + 30 * 24 * 3_600_000;
-  const restartProfile = await restartStore.addFromCreds("Restarted", {
-    accessToken: "before-restart-access",
-    refreshToken: "before-restart-refresh",
-    expiresAt: Date.now() - 3_600_000,
-    refreshTokenExpiresAt: refreshExpiry,
-    scopes: ["user:profile"],
-  });
-  const afterRestart = {
-    accessToken: "after-restart-access",
-    refreshToken: "after-restart-refresh",
-    expiresAt: Date.now() + 3_600_000,
-    refreshTokenExpiresAt: refreshExpiry,
-    scopes: ["user:profile"],
-  };
-  const restartPoller = new UsagePoller(
-    restartStore,
-    new TokenRefresher(),
-    new CredentialsManager(),
-    () => 240,
-    () => undefined,
-    { readProfileCreds: () => afterRestart }
-  );
-  await (restartPoller as never as { syncProfileConfigCreds(id: string, stored: unknown): Promise<unknown> })
-    .syncProfileConfigCreds(restartProfile.id, await restartStore.getCreds(restartProfile.id));
-  check(
-    "restart imports Claude's rotated tokens when refresh-token expiry is unchanged",
-    (await restartStore.getCreds(restartProfile.id))?.refreshToken === "after-restart-refresh"
-  );
-
-  const staleReplica = {
-    ...afterRestart,
-    refreshToken: "stale-refresh",
-  };
-  const stalePoller = new UsagePoller(
-    restartStore,
-    new TokenRefresher(),
-    new CredentialsManager(),
-    () => 240,
-    () => undefined,
-    { readProfileCreds: () => staleReplica }
-  );
-  await (stalePoller as never as { syncProfileConfigCreds(id: string, stored: unknown): Promise<unknown> })
-    .syncProfileConfigCreds(restartProfile.id, await restartStore.getCreds(restartProfile.id));
-  check(
-    "equal-age replica cannot restore an already spent refresh token",
-    (await restartStore.getCreds(restartProfile.id))?.refreshToken === "after-restart-refresh"
-  );
-
   const originalFetch = globalThis.fetch;
-  let fetchCalls = 0;
-  globalThis.fetch = (async () => {
-    fetchCalls++;
-    return new Response("{}", { status: 500 });
+  const f = createSyncFixture();
+  const a = await f.store.addFromCreds("A", creds("a1", 3_600_000));
+  f.manager.writeCreds(creds("a1", 3_600_000));
+  let usageCalls = 0;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.includes("/oauth/usage")) {
+      usageCalls++;
+      const auth = (init?.headers as Record<string, string>).Authorization;
+      return auth === "Bearer a2-access"
+        ? new Response(JSON.stringify({ five_hour: { utilization: 7, resets_at: null } }), { status: 200 })
+        : new Response("unauthorized", { status: 401 });
+    }
+    if (url.includes("/oauth/token")) {
+      return new Response(
+        JSON.stringify({ access_token: "a2-access", refresh_token: "a2-refresh", expires_in: 28_800 }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    return new Response("{}", { status: 404 });
   }) as typeof fetch;
   try {
-    const recoveredStore = createStore();
-    const recoveredProfile = await recoveredStore.addFromCreds("Recoverable", {
-      accessToken: "spent-access",
-      refreshToken: "spent-refresh",
-      expiresAt: Date.now() - 3_600_000,
-      refreshTokenExpiresAt: refreshExpiry,
-      scopes: ["user:profile"],
-    });
-    await recoveredStore.updateUsage(recoveredProfile.id, {
-      fetchedAt: Date.now(),
-      windows: [],
-      sessionPercent: null,
-      weeklyPercent: null,
-      error: "Failed to refresh token: HTTP 400 invalid_grant",
-    });
-    const recoveredPoller = new UsagePoller(
-      recoveredStore,
-      new TokenRefresher(),
-      new CredentialsManager(),
-      () => 240,
-      () => undefined,
-      { readProfileCreds: () => afterRestart }
-    );
-    await recoveredPoller.pollOne(recoveredProfile.id, false);
+    const poller = new UsagePoller(f.store, f.sync, () => 240, () => undefined);
+    await poller.pollOne(a.id, true);
+    check("a 401 triggers one locked refresh and a retry", usageCalls === 2);
+    check("usage is stored after the retry", f.store.get(a.id)?.lastUsage?.sessionPercent === 7);
     check(
-      "recovers a profile marked invalid when Claude persisted a newer generation",
-      (await recoveredStore.getCreds(recoveredProfile.id))?.refreshToken ===
-        "after-restart-refresh" && fetchCalls === 1
+      "the retry's rotation reaches Claude Code's file",
+      f.manager.readCurrent()?.refreshToken === "a2-refresh"
     );
-    fetchCalls = 0;
-
-    const skippedStore = createStore();
-    const skippedProfile = await skippedStore.addFromCreds("Needs auth", {
-      accessToken: "stored-access",
-      refreshToken: "stored-refresh",
-      expiresAt: 0,
-      scopes: ["user:profile"],
-    });
-    await skippedStore.updateUsage(skippedProfile.id, {
-      fetchedAt: Date.now(),
-      windows: [],
-      sessionPercent: null,
-      weeklyPercent: null,
-      error:
-        "Failed to refresh token: HTTP 400 from token endpoint: {\"error\":\"invalid_grant\"}",
-    });
-    const skippedPoller = new UsagePoller(
-      skippedStore,
-      new TokenRefresher(),
-      new CredentialsManager(),
-      () => 240,
-      () => undefined
-    );
-    await skippedPoller.pollOne(skippedProfile.id, false);
-    check("skips automatic retry after invalid_grant", fetchCalls === 0);
-    await skippedPoller.pollOne(skippedProfile.id, true);
-    check("skips forced retry after invalid_grant", fetchCalls === 0);
-
-    const activeStore = createStore();
-    const activeProfile = await activeStore.addFromCreds("Active", {
-      accessToken: "expired-access",
-      refreshToken: "must-not-be-spent",
-      expiresAt: Date.now() - 1,
-      scopes: ["user:profile"],
-    });
-    const activePoller = new UsagePoller(
-      activeStore,
-      new TokenRefresher(),
-      new CredentialsManager(),
-      () => 240,
-      () => undefined,
-      { isProfileActive: () => true }
-    );
-    await activePoller.pollOne(activeProfile.id, true);
-    check("never refreshes a token owned by an active Claude window", fetchCalls === 0);
   } finally {
     globalThis.fetch = originalFetch;
+    delete process.env.CLAUDE_CONFIG_DIR;
+    fs.rmSync(f.root, { recursive: true, force: true });
   }
 }
 
 async function runSwitchServiceTests(): Promise<void> {
   console.log("SwitchService:");
 
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cas-switch-test-"));
-  const credPath = path.join(tmpDir, ".credentials.json");
-  process.env.TEST_CRED_PATH = credPath;
-
-  const store = createStore();
-  const manager = new CredentialsManager();
-  const profile = await store.addFromCreds("Newater2", {
+  const f = createSyncFixture();
+  const profile = await f.store.addFromCreds("Newater2", {
     accessToken: "stored-access",
     refreshToken: "",
     expiresAt: 111,
     scopes: [],
   });
-  manager.writeCreds({
+  f.manager.writeCreds({
     accessToken: "current-access",
     refreshToken: "current-refresh",
     expiresAt: 222,
     scopes: ["user:profile"],
   });
 
-  const service = new SwitchService(store, manager);
+  const service = new SwitchService(f.store, f.manager, f.sync);
   const switchResult = await service.switchTo(profile.id);
   check(
     "incomplete profile switch requests reauthorization",
@@ -485,10 +575,11 @@ async function runSwitchServiceTests(): Promise<void> {
   );
   check(
     "switch does not store current login into incomplete profile",
-    (await store.getCreds(profile.id))?.refreshToken === ""
+    (await f.store.getCreds(profile.id))?.refreshToken === ""
   );
 
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+  delete process.env.CLAUDE_CONFIG_DIR;
+  fs.rmSync(f.root, { recursive: true, force: true });
 }
 
 async function runTokenRefresherTests(): Promise<void> {
@@ -548,7 +639,8 @@ async function runTokenRefresherTests(): Promise<void> {
     const defaultScopeBody = JSON.parse(String(capturedInit?.body));
     check(
       "uses default Claude Code scopes when missing",
-      defaultScopeBody.scope === "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+      defaultScopeBody.scope ===
+        "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload user:plugins"
     );
 
     let fetchCalls = 0;
@@ -588,7 +680,10 @@ async function runTokenRefresherTests(): Promise<void> {
 
 runProfileActivityTests();
 runBrowserOAuthTests();
+runIdentityTests();
 runAccountStoreTests()
+  .then(runClaudeLockTests)
+  .then(runCredentialSyncTests)
   .then(runUsagePollerTests)
   .then(runSwitchServiceTests)
   .then(runTokenRefresherTests)

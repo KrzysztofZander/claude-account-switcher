@@ -15,9 +15,9 @@ const STALE_MS = 60_000;
 const PENDING_MS = 300_000;
 
 /**
- * Records which saved profile is attached to a live VS Code window. Usage pollers
- * in other extension hosts consult these leases before attempting a rotating-token
- * refresh, so Claude Code remains the sole refresh owner for active sessions.
+ * Records which saved profile is attached to a live VS Code window, so other windows
+ * refuse to start a second Claude Code session (independent window, Say Hi, switch)
+ * on a login that is already in use.
  */
 export class ProfileActivityRegistry implements vscode.Disposable {
   private readonly leaseDir: string;
@@ -53,7 +53,12 @@ export class ProfileActivityRegistry implements vscode.Disposable {
     });
   }
 
-  isActive(id: string): boolean {
+  /**
+   * True when a live window (or a window that is still starting) uses the profile.
+   * `excludeSelf` ignores this window's own lease, e.g. when checking whether a
+   * profile can be moved into this window.
+   */
+  isActive(id: string, options: { excludeSelf?: boolean } = {}): boolean {
     let files: string[];
     try {
       files = fs.readdirSync(this.leaseDir);
@@ -82,7 +87,7 @@ export class ProfileActivityRegistry implements vscode.Disposable {
         }
         continue;
       }
-      if (lease.profileId === id) {
+      if (lease.profileId === id && !(options.excludeSelf && file === this.sessionPath)) {
         active = true;
       }
     }

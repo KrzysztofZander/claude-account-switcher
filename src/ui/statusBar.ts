@@ -1,6 +1,8 @@
 import * as vscode from "vscode";
 import { AccountStore } from "../accountStore";
+import { identityLabel } from "../identity";
 import { requiresProfileReauthorization } from "../oauth";
+import { ClaudeAuthIdentity } from "../types";
 
 /**
  * Status bar item: the active account + the 5h window usage %.
@@ -8,6 +10,7 @@ import { requiresProfileReauthorization } from "../oauth";
  */
 export class StatusBarController {
   private readonly item: vscode.StatusBarItem;
+  private unsavedIdentity: ClaudeAuthIdentity | undefined;
 
   constructor(private readonly store: AccountStore) {
     this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
@@ -15,13 +18,24 @@ export class StatusBarController {
     this.item.show();
   }
 
+  /** A logged-in Claude account that is not saved as a profile (or undefined). */
+  setUnsavedIdentity(identity: ClaudeAuthIdentity | undefined): void {
+    this.unsavedIdentity = identity;
+    this.refresh();
+  }
+
   refresh(): void {
     const activeId = this.store.getActiveId();
     const active = activeId ? this.store.get(activeId) : undefined;
 
     if (!active) {
-      this.item.text = "$(account) Claude: no account";
-      this.item.tooltip = "Click to add/switch a Claude account";
+      const unsaved = this.unsavedIdentity ? identityLabel(this.unsavedIdentity) : undefined;
+      this.item.text = unsaved
+        ? `$(account) Claude: ${unsaved} (not saved)`
+        : "$(account) Claude: no account";
+      this.item.tooltip = unsaved
+        ? `Claude Code is logged in as ${unsaved}, which is not saved as a profile. Use "Save current account".`
+        : "Click to add/switch a Claude account";
       this.item.backgroundColor = undefined;
       return;
     }
@@ -59,6 +73,6 @@ export class StatusBarController {
 
 function displayUsageError(error: string): string {
   return requiresProfileReauthorization(error)
-    ? "Needs reauthorization. Use Auth to refresh this profile."
+    ? "Login was revoked or expired. Use Auth to reauthorize this profile."
     : error;
 }

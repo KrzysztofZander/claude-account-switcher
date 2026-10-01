@@ -2,7 +2,7 @@
   "name": "claude-code-account-switcher",
   "displayName": "Claude Multi-Account Switcher",
   "description": "Quickly switch between Claude accounts (subscriptions) in Claude Code, with live usage limits.",
-  "version": "0.2.5",
+  "version": "0.3.0",
   "publisher": "KrzysztofZander",
   "author": {
     "name": "Krzysztof Zander",
@@ -63,6 +63,11 @@
         "icon": "$(add)"
       },
       {
+        "command": "claudeSwitcher.addAccount",
+        "title": "Claude: Add another account (isolated login)",
+        "icon": "$(person-add)"
+      },
+      {
         "command": "claudeSwitcher.switchAccount",
         "title": "Claude: Switch account",
         "icon": "$(arrow-swap)"
@@ -84,7 +89,7 @@
       },
       {
         "command": "claudeSwitcher.login",
-        "title": "Claude: Log in from terminal",
+        "title": "Claude: Log in from terminal (replaces the current account)",
         "icon": "$(sign-in)"
       },
       {
@@ -142,7 +147,7 @@
           "group": "navigation@4"
         },
         {
-          "command": "claudeSwitcher.login",
+          "command": "claudeSwitcher.addAccount",
           "when": "view == claudeSwitcher.accountsView",
           "group": "navigation@5"
         },
